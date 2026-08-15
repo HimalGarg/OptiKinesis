@@ -308,9 +308,9 @@ A working professional (40–60 years) experiencing progressive upper-limb motor
 
 | Member | Role | Contributions |
 |---|---|---|
-| **Govind Upadhyay** | Product & AI/CV Lead | Problem framing, MediaPipe/OpenCV head-pose control, blink-to-click logic, system architecture, prototype demo, pitch narrative |
+| **Himal Garg** | Product & AI/CV Lead | Problem framing, MediaPipe/OpenCV head-pose control, blink-to-click logic, system architecture, prototype demo, pitch narrative |
 | **Aditya Kumar** | Hardware & IoT Lead | MotionGlass concept, IMU + BLE architecture, sensor selection, wearable prototyping plan, device diagnostics, hardware feasibility |
-| **Himal Garg** | Research, UX & Impact Lead | NGO insight documentation, user journey, accessibility workflow design, testing plan, caregiver feedback, pilot-partner outreach |
+| **Govind Upadhyay** | Research, UX & Impact Lead | NGO insight documentation, user journey, accessibility workflow design, testing plan, caregiver feedback, pilot-partner outreach |
 
 ---
 
