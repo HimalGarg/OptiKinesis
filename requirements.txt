@@ -1,0 +1,9 @@
+flask
+opencv-python
+mediapipe==0.10.9
+pyautogui
+numpy
+twilio
+PyQt5
+pynput
+python-dotenv

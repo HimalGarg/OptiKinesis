@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Intentix floating assistive overlay for gaze, blink, and voice control.">
+    <title>Intentix Floating Overlay</title>
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👁️</text></svg>">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+
+<body>
+    <div id="timer-overlay">5</div>
+
+    <div id="fatigue-toast" class="fatigue-toast hidden">
+        <span class="fatigue-icon">😌</span>
+        <span class="fatigue-message">You've been blinking a lot. Please slow down and take a short rest.</span>
+    </div>
+
+    <div id="voice-confirm-modal" class="modal-overlay hidden">
+        <div class="voice-modal-content">
+            <h3>Confirm Voice Action</h3>
+            <p id="voice-confirm-message">Confirm this action?</p>
+            <div class="voice-modal-actions">
+                <button class="btn-confirm" onclick="confirmVoiceAction()" aria-label="Confirm action">YES</button>
+                <button class="btn-deny" onclick="cancelVoiceAction()" aria-label="Cancel action">NO</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="floating-status" aria-live="polite">
+        <span id="mic-status-dot" class="status-dot idle"></span>
+        <span id="mic-status-text">Mic idle. Tap 🎤 to start voice.</span>
+    </div>
+
+    <div id="keyboard-overlay" class="overlay hidden" role="dialog" aria-label="Keyboard overlay">
+        <div class="overlay-header">
+            <h2>Keyboard Module</h2>
+            <button class="overlay-close" onclick="closeOverlay('keyboard-overlay')" aria-label="Close keyboard module">✕</button>
+        </div>
+        <div class="overlay-body keyboard-shell">
+            <section class="keyboard-left" aria-label="Typing keyboard">
+                <textarea id="output-area" placeholder="> TYPE WITH GAZE + BLINK" aria-label="Text input area"></textarea>
+                <div id="keyboard" role="group" aria-label="On-screen keyboard">
+                    <div class="key" role="button" aria-label="1" tabindex="0" onclick="add('1')">1</div>
+                    <div class="key" role="button" aria-label="2" tabindex="0" onclick="add('2')">2</div>
+                    <div class="key" role="button" aria-label="3" tabindex="0" onclick="add('3')">3</div>
+                    <div class="key" role="button" aria-label="4" tabindex="0" onclick="add('4')">4</div>
+                    <div class="key" role="button" aria-label="5" tabindex="0" onclick="add('5')">5</div>
+                    <div class="key" role="button" aria-label="6" tabindex="0" onclick="add('6')">6</div>
+                    <div class="key" role="button" aria-label="7" tabindex="0" onclick="add('7')">7</div>
+                    <div class="key" role="button" aria-label="8" tabindex="0" onclick="add('8')">8</div>
+                    <div class="key" role="button" aria-label="9" tabindex="0" onclick="add('9')">9</div>
+                    <div class="key" role="button" aria-label="0" tabindex="0" onclick="add('0')">0</div>
+
+                    <div class="key" role="button" aria-label="Q" tabindex="0" onclick="add('Q')">Q</div>
+                    <div class="key" role="button" aria-label="W" tabindex="0" onclick="add('W')">W</div>
+                    <div class="key" role="button" aria-label="E" tabindex="0" onclick="add('E')">E</div>
+                    <div class="key" role="button" aria-label="R" tabindex="0" onclick="add('R')">R</div>
+                    <div class="key" role="button" aria-label="T" tabindex="0" onclick="add('T')">T</div>
+                    <div class="key" role="button" aria-label="Y" tabindex="0" onclick="add('Y')">Y</div>
+                    <div class="key" role="button" aria-label="U" tabindex="0" onclick="add('U')">U</div>
+                    <div class="key" role="button" aria-label="I" tabindex="0" onclick="add('I')">I</div>
+                    <div class="key" role="button" aria-label="O" tabindex="0" onclick="add('O')">O</div>
+                    <div class="key" role="button" aria-label="P" tabindex="0" onclick="add('P')">P</div>
+
+                    <div class="key" role="button" aria-label="A" tabindex="0" onclick="add('A')">A</div>
+                    <div class="key" role="button" aria-label="S" tabindex="0" onclick="add('S')">S</div>
+                    <div class="key" role="button" aria-label="D" tabindex="0" onclick="add('D')">D</div>
+                    <div class="key" role="button" aria-label="F" tabindex="0" onclick="add('F')">F</div>
+                    <div class="key" role="button" aria-label="G" tabindex="0" onclick="add('G')">G</div>
+                    <div class="key" role="button" aria-label="H" tabindex="0" onclick="add('H')">H</div>
+                    <div class="key" role="button" aria-label="J" tabindex="0" onclick="add('J')">J</div>
+                    <div class="key" role="button" aria-label="K" tabindex="0" onclick="add('K')">K</div>
+                    <div class="key" role="button" aria-label="L" tabindex="0" onclick="add('L')">L</div>
+                    <div class="key" role="button" aria-label="Period" tabindex="0" onclick="add('.')">.</div>
+
+                    <div class="key" role="button" aria-label="Z" tabindex="0" onclick="add('Z')">Z</div>
+                    <div class="key" role="button" aria-label="X" tabindex="0" onclick="add('X')">X</div>
+                    <div class="key" role="button" aria-label="C" tabindex="0" onclick="add('C')">C</div>
+                    <div class="key" role="button" aria-label="V" tabindex="0" onclick="add('V')">V</div>
+                    <div class="key" role="button" aria-label="B" tabindex="0" onclick="add('B')">B</div>
+                    <div class="key" role="button" aria-label="N" tabindex="0" onclick="add('N')">N</div>
+                    <div class="key" role="button" aria-label="M" tabindex="0" onclick="add('M')">M</div>
+                    <div class="key" role="button" aria-label="Comma" tabindex="0" onclick="add(',')">,</div>
+                    <div class="key backspace span-2" role="button" aria-label="Backspace" tabindex="0" onclick="back()">BACK</div>
+
+                    <div class="key clear span-2" role="button" aria-label="Clear all text" tabindex="0" onclick="clr()">CLR</div>
+                    <div class="key nav-key span-2" role="button" aria-label="Move cursor left" tabindex="0" onclick="moveCursor(-1)">&lt;</div>
+                    <div class="key span-4" role="button" aria-label="Space" tabindex="0" onclick="add(' ')">SPACE</div>
+                    <div class="key nav-key span-2" role="button" aria-label="Move cursor right" tabindex="0" onclick="moveCursor(1)">&gt;</div>
+                </div>
+            </section>
+
+            <aside class="keyboard-actions" aria-label="Keyboard actions">
+                <button class="action-btn" onclick="sendAction('google')">SEARCH GOOGLE</button>
+                <button class="action-btn" onclick="sendAction('youtube')">SEARCH YOUTUBE</button>
+                <button class="action-btn" onclick="sendAction('type_external')">TYPE EXTERNAL</button>
+            </aside>
+        </div>
+    </div>
+
+    <div id="camera-overlay" class="overlay hidden" role="dialog" aria-label="Camera overlay">
+        <div class="overlay-header">
+            <h2>Camera Module</h2>
+            <button class="overlay-close" onclick="closeOverlay('camera-overlay')" aria-label="Close camera module">✕</button>
+        </div>
+        <div class="overlay-body camera-shell">
+            <img id="camera-feed" src="{{ url_for('video_feed') }}" alt="Live tracking camera feed">
+        </div>
+    </div>
+
+    <div id="emergency-overlay" class="overlay hidden" role="dialog" aria-label="Emergency overlay">
+        <div class="overlay-header">
+            <h2>Emergency Module</h2>
+            <button class="overlay-close" onclick="closeOverlay('emergency-overlay')" aria-label="Close emergency module">✕</button>
+        </div>
+        <div class="overlay-body emergency-shell">
+            <div class="contact-manager">
+                <label for="contact-number-input">Emergency Contacts</label>
+                <div class="contact-entry-row">
+                    <input type="text" id="contact-number-input" placeholder="Enter phone number" autocomplete="tel"
+                        aria-label="Enter emergency contact number">
+                    <button id="add-contact-btn" class="action-btn" type="button">Add Contact</button>
+                </div>
+                <ul id="contact-list"></ul>
+            </div>
+
+            <div class="emergency-group">
+                <button class="action-btn sos-btn" onclick="alert('Configure Number first!')" id="btn-msg"
+                    aria-label="Send emergency message to contact">MSG CONTACT</button>
+                <button class="action-btn sos-btn" onclick="sendAction('emergency_call')" id="btn-dial"
+                    aria-label="Call emergency contact">EMERGENCY CONTACT</button>
+                <button class="action-btn sos-btn" onclick="confirmAction('emergency_police', this)"
+                    aria-label="Dial 100 for police">DIAL 100</button>
+                <button class="action-btn sos-btn" onclick="confirmAction('emergency_ambulance', this)"
+                    aria-label="Dial 112 for ambulance">DIAL 112</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="control-overlay" class="overlay hidden" role="dialog" aria-label="Control overlay">
+        <div class="overlay-header">
+            <h2>Control Module</h2>
+            <button class="overlay-close" onclick="closeOverlay('control-overlay')" aria-label="Close control module">✕</button>
+        </div>
+        <div class="overlay-body control-shell">
+            <div class="control-block">
+                <label for="control-cursor-speed">Cursor Speed: <span id="cursor-speed-value">0.5</span></label>
+                <input type="range" id="control-cursor-speed" min="0.3" max="1.5" step="0.1" value="0.5">
+            </div>
+
+            <div class="control-block">
+                <label for="control-blink-sensitivity">Blink Sensitivity</label>
+                <input type="number" id="control-blink-sensitivity" step="0.01" value="0.26" max="0.35" min="0.15">
+            </div>
+
+            <div class="control-block">
+                <label for="control-lock-delay">Lock Delay (seconds)</label>
+                <input type="number" id="control-lock-delay" step="0.1" value="1.5" min="0.5" max="5">
+            </div>
+
+            <div class="control-actions">
+                <button class="action-btn" onclick="saveControlSettings()">SAVE SETTINGS</button>
+                <button class="action-btn" onclick="sendAction('toggle_overlay')">TOGGLE CURSOR OVERLAY</button>
+                <button class="action-btn" onclick="sendAction('toggle_mouse')">TOGGLE MOUSE CONTROL</button>
+            </div>
+
+            <div id="control-status" class="control-status" aria-live="polite">Settings ready.</div>
+        </div>
+    </div>
+
+    <div id="floating-bar" aria-label="Floating control bar">
+        <button id="mic-btn" class="bar-btn" onclick="toggleMic()" aria-label="Toggle microphone">🎤</button>
+        <button id="bar-keyboard-btn" class="bar-btn" onclick="openKeyboard()" aria-label="Open keyboard module">⌨</button>
+        <button id="bar-camera-btn" class="bar-btn" onclick="toggleCamera()" aria-label="Open camera module">📷</button>
+        <button id="bar-emergency-btn" class="bar-btn" onclick="openEmergency()" aria-label="Open emergency module">🚨</button>
+        <button id="bar-control-btn" class="bar-btn" onclick="openControl()" aria-label="Open control module">⚙</button>
+        <button class="bar-btn" disabled aria-label="Health module disabled">📊</button>
+    </div>
+
+    <audio id="click-sound" src="{{ url_for('static', filename='sounds/click.mp3') }}"></audio>
+
+    <script>
+        const overlayIds = ['keyboard-overlay', 'camera-overlay', 'emergency-overlay', 'control-overlay'];
+        const overlayButtonMap = {
+            'keyboard-overlay': 'bar-keyboard-btn',
+            'camera-overlay': 'bar-camera-btn',
+            'emergency-overlay': 'bar-emergency-btn',
+            'control-overlay': 'bar-control-btn'
+        };
+
+        const textarea = document.getElementById('output-area');
+        const timerOverlay = document.getElementById('timer-overlay');
+        const clickSound = document.getElementById('click-sound');
+        const micBtn = document.getElementById('mic-btn');
+        const micStatusDot = document.getElementById('mic-status-dot');
+        const micStatusText = document.getElementById('mic-status-text');
+        const voiceConfirmModal = document.getElementById('voice-confirm-modal');
+        const voiceConfirmMessage = document.getElementById('voice-confirm-message');
+
+        const controlCursorSpeed = document.getElementById('control-cursor-speed');
+        const controlBlinkSensitivity = document.getElementById('control-blink-sensitivity');
+        const controlLockDelay = document.getElementById('control-lock-delay');
+        const cursorSpeedValue = document.getElementById('cursor-speed-value');
+        const controlStatus = document.getElementById('control-status');
+
+        const contactNumberInput = document.getElementById('contact-number-input');
+        const addContactBtn = document.getElementById('add-contact-btn');
+        const contactList = document.getElementById('contact-list');
+
+        const fatigueToast = document.getElementById('fatigue-toast');
+
+        const CONTACTS_STORAGE_KEY = 'intentix-emergency-contacts';
+        const LOCK_DELAY_KEY = 'intentix-lock-delay';
+
+        let activeOverlayId = null;
+        let emergencyContacts = [];
+        let activeEmergencyContact = '';
+
+        let recognition = null;
+        let isListening = false;
+        let micPermissionGranted = false;
+
+        function playClick() {
+            if (!clickSound) return;
+            clickSound.currentTime = 0;
+            clickSound.play().catch(() => { });
+        }
+
+        function syncOverlayButtonState() {
+            Object.entries(overlayButtonMap).forEach(([overlayId, buttonId]) => {
+                const button = document.getElementById(buttonId);
+                button.classList.toggle('active', activeOverlayId === overlayId);
+            });
+        }
+
+        function closeOverlay(id) {
+            const target = document.getElementById(id);
+            if (!target) return;
+            target.classList.add('hidden');
+            if (activeOverlayId === id) {
+                activeOverlayId = null;
+            }
+            syncOverlayButtonState();
+        }
+
+        function toggleOverlay(id) {
+            const target = document.getElementById(id);
+            if (!target) return;
+
+            const willOpen = target.classList.contains('hidden');
+
+            overlayIds.forEach(overlayId => {
+                document.getElementById(overlayId).classList.add('hidden');
+            });
+
+            if (willOpen) {
+                target.classList.remove('hidden');
+                activeOverlayId = id;
+            } else {
+                activeOverlayId = null;
+            }
+
+            syncOverlayButtonState();
+
+            if (activeOverlayId === 'keyboard-overlay') {
+                textarea.focus();
+            }
+        }
+
+        function openKeyboard() {
+            toggleOverlay('keyboard-overlay');
+        }
+
+        function toggleCamera() {
+            toggleOverlay('camera-overlay');
+        }
+
+        function openEmergency() {
+            toggleOverlay('emergency-overlay');
+        }
+
+        function openControl() {
+            toggleOverlay('control-overlay');
+        }
+
+        function add(char) {
+            const s = textarea.selectionStart;
+            const e = textarea.selectionEnd;
+            const t = textarea.value;
+            textarea.value = t.substring(0, s) + char + t.substring(e);
+            textarea.selectionStart = textarea.selectionEnd = s + 1;
+            textarea.focus();
+        }
+
+        function back() {
+            const s = textarea.selectionStart;
+            const e = textarea.selectionEnd;
+            const t = textarea.value;
+            if (s !== e) {
+                textarea.value = t.substring(0, s) + t.substring(e);
+                textarea.selectionStart = textarea.selectionEnd = s;
+            } else if (s > 0) {
+                textarea.value = t.substring(0, s - 1) + t.substring(e);
+                textarea.selectionStart = textarea.selectionEnd = s - 1;
+            }
+            textarea.focus();
+        }
+
+        function clr() {
+            textarea.value = '';
+            textarea.focus();
+        }
+
+        function moveCursor(delta) {
+            const p = textarea.selectionStart;
+            const nextPos = Math.max(0, Math.min(textarea.value.length, p + delta));
+            textarea.setSelectionRange(nextPos, nextPos);
+            textarea.focus();
+        }
+
+        function startCountdown() {
+            let count = 5;
+            timerOverlay.style.display = 'grid';
+            timerOverlay.textContent = count;
+            const interval = setInterval(() => {
+                count -= 1;
+                if (count > 0) {
+                    timerOverlay.textContent = count;
+                } else {
+                    clearInterval(interval);
+                    timerOverlay.style.display = 'none';
+                }
+            }, 1000);
+        }
+
+        function sendAction(action) {
+            const text = textarea.value;
+
+            if (action === 'type_external') {
+                startCountdown();
+            }
+
+            fetch('/perform_action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action, text })
+            }).catch(() => {
+                controlStatus.textContent = 'Failed to trigger action.';
+            });
+        }
+
+        function confirmAction(action, el) {
+            if (el) {
+                el.classList.add('confirming');
+            }
+            const confirmed = confirm('CONFIRM EMERGENCY ACTION? This will dial immediately.');
+            if (el) {
+                el.classList.remove('confirming');
+                if (confirmed) {
+                    el.classList.add('confirmed');
+                    setTimeout(() => el.classList.remove('confirmed'), 2000);
+                }
+            }
+            if (confirmed) {
+                sendAction(action);
+            }
+        }
+
+        function sanitizePhoneNumber(value) {
+            const trimmed = (value || '').trim();
+            if (!trimmed) return '';
+            const digits = trimmed.replace(/\D/g, '');
+            if (!digits) return '';
+            return trimmed.startsWith('+') ? '+' + digits : digits;
+        }
+
+        function isValidPhoneNumber(value) {
+            const digits = (value || '').replace(/\D/g, '');
+            return digits.length >= 7 && digits.length <= 15;
+        }
+
+        function saveContactsToStorage() {
+            localStorage.setItem(CONTACTS_STORAGE_KEY, JSON.stringify(emergencyContacts));
+        }
+
+        function syncEmergencyContact(contact) {
+            return fetch('/update_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ emergency_contact: contact })
+            });
+        }
+
+        function updateEmergencyButtons(contact) {
+            const btnMsg = document.getElementById('btn-msg');
+            const btnDial = document.getElementById('btn-dial');
+            const configured = contact && contact.length > 5;
+
+            if (configured) {
+                btnMsg.onclick = () => sendAction('emergency_contact');
+                btnDial.onclick = () => sendAction('emergency_call');
+            } else {
+                btnMsg.onclick = () => alert('Configure Number first!');
+                btnDial.onclick = () => alert('Configure Number first!');
+            }
+        }
+
+        function renderContacts() {
+            contactList.innerHTML = '';
+
+            if (!emergencyContacts.length) {
+                const empty = document.createElement('li');
+                empty.className = 'contact-empty';
+                empty.textContent = 'No contacts added yet.';
+                contactList.appendChild(empty);
+                return;
+            }
+
+            emergencyContacts.forEach(contact => {
+                const item = document.createElement('li');
+                item.className = 'contact-item';
+                if (contact === activeEmergencyContact) {
+                    item.classList.add('active');
+                }
+
+                const selectBtn = document.createElement('button');
+                selectBtn.type = 'button';
+                selectBtn.className = 'contact-select';
+                selectBtn.textContent = contact;
+                selectBtn.onclick = () => setActiveEmergencyContact(contact, true);
+
+                const removeBtn = document.createElement('button');
+                removeBtn.type = 'button';
+                removeBtn.className = 'contact-remove';
+                removeBtn.textContent = 'Remove';
+                removeBtn.onclick = () => removeEmergencyContact(contact);
+
+                item.append(selectBtn, removeBtn);
+                contactList.appendChild(item);
+            });
+        }
+
+        function setActiveEmergencyContact(contact, syncToServer) {
+            activeEmergencyContact = contact;
+            updateEmergencyButtons(contact);
+            renderContacts();
+
+            if (syncToServer) {
+                syncEmergencyContact(contact).catch(() => {
+                    controlStatus.textContent = 'Failed to sync emergency contact.';
+                });
+            }
+        }
+
+        function addEmergencyContact() {
+            const normalized = sanitizePhoneNumber(contactNumberInput.value);
+            if (!isValidPhoneNumber(normalized)) {
+                alert('Enter a valid phone number with 7 to 15 digits.');
+                contactNumberInput.focus();
+                return;
+            }
+
+            if (!emergencyContacts.includes(normalized)) {
+                emergencyContacts.unshift(normalized);
+                saveContactsToStorage();
+            }
+
+            setActiveEmergencyContact(normalized, true);
+            contactNumberInput.value = '';
+        }
+
+        function removeEmergencyContact(contact) {
+            emergencyContacts = emergencyContacts.filter(item => item !== contact);
+            saveContactsToStorage();
+
+            if (activeEmergencyContact === contact) {
+                const next = emergencyContacts[0] || '';
+                activeEmergencyContact = next;
+                updateEmergencyButtons(next);
+                renderContacts();
+                syncEmergencyContact(next).catch(() => {
+                    controlStatus.textContent = 'Failed to sync emergency contact.';
+                });
+                return;
+            }
+
+            renderContacts();
+        }
+
+        function loadEmergencyContacts() {
+            let stored = [];
+            try {
+                const raw = localStorage.getItem(CONTACTS_STORAGE_KEY);
+                stored = raw ? JSON.parse(raw) : [];
+            } catch (e) {
+                stored = [];
+            }
+
+            emergencyContacts = [...new Set((Array.isArray(stored) ? stored : [])
+                .map(sanitizePhoneNumber)
+                .filter(isValidPhoneNumber))];
+
+            if (emergencyContacts.length) {
+                setActiveEmergencyContact(emergencyContacts[0], true);
+            } else {
+                updateEmergencyButtons('');
+                renderContacts();
+            }
+        }
+
+        function updateCursorSpeedLabel() {
+            cursorSpeedValue.textContent = controlCursorSpeed.value;
+        }
+
+        function saveControlSettings() {
+            const cursorSpeed = parseFloat(controlCursorSpeed.value);
+            const blinkSensitivity = parseFloat(controlBlinkSensitivity.value);
+            const lockDelay = parseFloat(controlLockDelay.value);
+
+            localStorage.setItem(LOCK_DELAY_KEY, String(lockDelay));
+
+            const payload = {
+                cursor_speed: cursorSpeed,
+                blink_sensitivity: blinkSensitivity,
+                emergency_contact: activeEmergencyContact || ''
+            };
+
+            fetch('/update_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+                .then(r => r.json())
+                .then(() => {
+                    controlStatus.textContent = 'Control settings saved.';
+                })
+                .catch(() => {
+                    controlStatus.textContent = 'Failed to save control settings.';
+                });
+        }
+
+        function loadControlSettings() {
+            const lockDelay = localStorage.getItem(LOCK_DELAY_KEY);
+            if (lockDelay) {
+                controlLockDelay.value = lockDelay;
+            }
+            updateCursorSpeedLabel();
+        }
+
+        function setMicVisualState(state, message) {
+            micBtn.classList.remove('listening', 'processing', 'executed', 'error');
+            micStatusDot.classList.remove('idle', 'listening', 'processing', 'executed', 'error');
+
+            if (state !== 'idle') {
+                micBtn.classList.add(state);
+            }
+            micStatusDot.classList.add(state);
+
+            if (message) {
+                micStatusText.textContent = message;
+            }
+        }
+
+        async function requestMicPermission() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                stream.getTracks().forEach(track => track.stop());
+                micPermissionGranted = true;
+                setMicVisualState('idle', 'Mic ready. Tap 🎤 and speak.');
+                return true;
+            } catch (err) {
+                micPermissionGranted = false;
+                setMicVisualState('error', 'Microphone access denied or unavailable.');
+                return false;
+            }
+        }
+
+        function stopListening() {
+            isListening = false;
+            if (recognition) {
+                try {
+                    recognition.stop();
+                } catch (e) { }
+            }
+            setMicVisualState('idle', 'Mic idle. Tap 🎤 to start voice.');
+        }
+
+        async function startListening() {
+            if (!recognition) {
+                setMicVisualState('error', 'Voice recognition is not supported in this browser.');
+                return;
+            }
+
+            if (!micPermissionGranted) {
+                const granted = await requestMicPermission();
+                if (!granted) return;
+            }
+
+            try {
+                recognition.start();
+            } catch (e) {
+                if (e.name === 'InvalidStateError') {
+                    recognition.stop();
+                    setTimeout(() => recognition.start(), 100);
+                } else {
+                    setMicVisualState('error', 'Unable to start voice recognition.');
+                }
+            }
+        }
+
+        function toggleMic() {
+            if (isListening) {
+                stopListening();
+            } else {
+                startListening();
+            }
+        }
+
+        function processVoiceCommand(text) {
+            setMicVisualState('processing', `Processing: "${text}"`);
+
+            fetch('/voice_command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+            })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'pending_confirmation') {
+                        voiceConfirmMessage.textContent = data.description;
+                        voiceConfirmModal.classList.remove('hidden');
+                        setMicVisualState('idle', 'Voice action waiting for confirmation.');
+                        return;
+                    }
+
+                    if (data.status === 'success') {
+                        setMicVisualState('executed', data.message || 'Voice action executed.');
+                    } else if (data.status === 'unknown') {
+                        setMicVisualState('idle', 'Unknown command. Try again.');
+                    } else if (data.status === 'error') {
+                        setMicVisualState('error', data.message || 'Voice action failed.');
+                    } else {
+                        setMicVisualState('executed', data.message || 'Voice command processed.');
+                    }
+
+                    setTimeout(() => {
+                        if (!isListening) {
+                            setMicVisualState('idle', 'Mic idle. Tap 🎤 to start voice.');
+                        }
+                    }, 1600);
+                })
+                .catch(() => {
+                    setMicVisualState('error', 'Error sending voice command.');
+                });
+        }
+
+        function confirmVoiceAction() {
+            voiceConfirmModal.classList.add('hidden');
+            fetch('/confirm_action', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    setMicVisualState('executed', data.message || 'Voice action confirmed.');
+                })
+                .catch(() => {
+                    setMicVisualState('error', 'Failed to confirm voice action.');
+                });
+        }
+
+        function cancelVoiceAction() {
+            voiceConfirmModal.classList.add('hidden');
+            fetch('/cancel_action', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    setMicVisualState('idle', data.message || 'Voice action canceled.');
+                })
+                .catch(() => {
+                    setMicVisualState('error', 'Failed to cancel voice action.');
+                });
+        }
+
+        function initVoiceRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                micBtn.disabled = true;
+                setMicVisualState('error', 'Voice recognition is not supported in this browser.');
+                return;
+            }
+
+            recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+            recognition.maxAlternatives = 1;
+
+            recognition.onstart = function () {
+                isListening = true;
+                setMicVisualState('listening', 'Listening... Speak your command.');
+            };
+
+            recognition.onresult = function (event) {
+                let finalTranscript = '';
+                let interimTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const transcript = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                        finalTranscript += transcript;
+                    } else {
+                        interimTranscript += transcript;
+                    }
+                }
+
+                if (interimTranscript) {
+                    setMicVisualState('listening', `Heard: "${interimTranscript}"`);
+                }
+
+                if (finalTranscript) {
+                    processVoiceCommand(finalTranscript);
+                }
+            };
+
+            recognition.onerror = function (event) {
+                isListening = false;
+                if (event.error === 'not-allowed') {
+                    setMicVisualState('error', 'Microphone permission denied.');
+                } else if (event.error === 'no-speech') {
+                    setMicVisualState('idle', 'No speech detected.');
+                } else {
+                    setMicVisualState('error', `Voice error: ${event.error}`);
+                }
+            };
+
+            recognition.onend = function () {
+                isListening = false;
+                if (!voiceConfirmModal.classList.contains('hidden')) {
+                    return;
+                }
+                setMicVisualState('idle', 'Mic idle. Tap 🎤 to start voice.');
+            };
+        }
+
+        function checkFatigueStatus() {
+            fetch('/fatigue_status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.should_show_toast) {
+                        fatigueToast.classList.remove('hidden');
+                        fatigueToast.classList.add('visible');
+                        setTimeout(() => {
+                            fatigueToast.classList.remove('visible');
+                            fatigueToast.classList.add('hidden');
+                        }, 4500);
+                    }
+                })
+                .catch(() => { });
+        }
+
+        document.querySelectorAll('.bar-btn, .action-btn, .overlay-close').forEach(el => {
+            el.addEventListener('click', () => {
+                if (!el.disabled) {
+                    playClick();
+                }
+            });
+        });
+
+        document.querySelectorAll('.key').forEach(key => {
+            key.addEventListener('click', playClick);
+            key.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    key.click();
+                }
+            });
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && activeOverlayId) {
+                closeOverlay(activeOverlayId);
+            }
+        });
+
+        addContactBtn.addEventListener('click', addEmergencyContact);
+        contactNumberInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addEmergencyContact();
+            }
+        });
+
+        controlCursorSpeed.addEventListener('input', updateCursorSpeedLabel);
+
+        window.onload = () => {
+            loadEmergencyContacts();
+            loadControlSettings();
+            initVoiceRecognition();
+            checkFatigueStatus();
+            setInterval(checkFatigueStatus, 3000);
+        };
+    </script>
+</body>
+
+</html>
