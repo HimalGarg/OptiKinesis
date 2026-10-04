@@ -1,12 +1,19 @@
-import sys
-from PyQt5.QtWidgets import QApplication
-from desktop_overlay import GazeClickBridge
+"""Regression tests for overlay callback dispatch."""
 
-app = QApplication(sys.argv)
-bridge = GazeClickBridge()
-try:
-    bridge._handle_blink_click(10, 10)
-    print("Direct call success")
-except Exception as e:
-    import traceback
-    traceback.print_exc()
+import unittest
+from unittest import mock
+
+import desktop_overlay
+
+
+class OverlayCallbackTests(unittest.TestCase):
+    def test_action_callback_receives_action_and_text(self):
+        callback = mock.Mock(return_value={"status": "ok"})
+        with mock.patch.object(desktop_overlay, "_action_executor", callback):
+            result = desktop_overlay._perform_action("google", "accessibility")
+        callback.assert_called_once_with("google", "accessibility")
+        self.assertEqual(result, {"status": "ok"})
+
+
+if __name__ == "__main__":
+    unittest.main()

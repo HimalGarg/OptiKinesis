@@ -4,8 +4,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Intentix floating assistive overlay for gaze, blink, and voice control.">
-    <title>Intentix Floating Overlay</title>
+    <meta name="description" content="OptiKinesis assistive overlay for head-pose, blink, and voice control.">
+    <title>OptiKinesis Floating Overlay</title>
     <link rel="icon"
         href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👁️</text></svg>">
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap"
@@ -133,7 +133,7 @@
             <div class="emergency-group">
                 <button class="action-btn sos-btn" onclick="alert('Configure Number first!')" id="btn-msg"
                     aria-label="Send emergency message to contact">MSG CONTACT</button>
-                <button class="action-btn sos-btn" onclick="sendAction('emergency_call')" id="btn-dial"
+                <button class="action-btn sos-btn" onclick="confirmAction('emergency_call', this)" id="btn-dial"
                     aria-label="Call emergency contact">EMERGENCY CONTACT</button>
                 <button class="action-btn sos-btn" onclick="confirmAction('emergency_police', this)"
                     aria-label="Dial 100 for police">DIAL 100</button>
@@ -160,6 +160,21 @@
             </div>
 
             <div class="control-block">
+                <label for="control-cursor-scope">Cursor Scope (lower is more sensitive)</label>
+                <input type="number" id="control-cursor-scope" step="0.05" value="1" max="2" min="0.35">
+            </div>
+
+            <div class="control-block">
+                <label for="control-blinks-required">Deliberate Blinks Per Click</label>
+                <input type="number" id="control-blinks-required" step="1" value="2" max="2" min="1">
+            </div>
+
+            <div class="control-block">
+                <label for="control-blink-window">Blink Sequence Window (seconds)</label>
+                <input type="number" id="control-blink-window" step="0.1" value="1.5" max="3" min="0.5">
+            </div>
+
+            <div class="control-block">
                 <label for="control-lock-delay">Lock Delay (seconds)</label>
                 <input type="number" id="control-lock-delay" step="0.1" value="1.5" min="0.5" max="5">
             </div>
@@ -168,6 +183,8 @@
                 <button class="action-btn" onclick="saveControlSettings()">SAVE SETTINGS</button>
                 <button class="action-btn" onclick="sendAction('toggle_overlay')">TOGGLE CURSOR OVERLAY</button>
                 <button class="action-btn" onclick="sendAction('toggle_mouse')">TOGGLE MOUSE CONTROL</button>
+                <button class="action-btn" onclick="sendAction('calibrate')">CALIBRATE CENTER</button>
+                <button class="action-btn" onclick="sendAction('toggle_pause')">PAUSE / RESUME</button>
             </div>
 
             <div id="control-status" class="control-status" aria-live="polite">Settings ready.</div>
@@ -205,6 +222,9 @@
 
         const controlCursorSpeed = document.getElementById('control-cursor-speed');
         const controlBlinkSensitivity = document.getElementById('control-blink-sensitivity');
+        const controlCursorScope = document.getElementById('control-cursor-scope');
+        const controlBlinksRequired = document.getElementById('control-blinks-required');
+        const controlBlinkWindow = document.getElementById('control-blink-window');
         const controlLockDelay = document.getElementById('control-lock-delay');
         const cursorSpeedValue = document.getElementById('cursor-speed-value');
         const controlStatus = document.getElementById('control-status');
@@ -215,8 +235,10 @@
 
         const fatigueToast = document.getElementById('fatigue-toast');
 
-        const CONTACTS_STORAGE_KEY = 'intentix-emergency-contacts';
-        const LOCK_DELAY_KEY = 'intentix-lock-delay';
+        const CONTACTS_STORAGE_KEY = 'optikinesis-emergency-contacts';
+        const LOCK_DELAY_KEY = 'optikinesis-lock-delay';
+        const LEGACY_CONTACTS_STORAGE_KEY = 'intentix-emergency-contacts';
+        const LEGACY_LOCK_DELAY_KEY = 'intentix-lock-delay';
 
         let activeOverlayId = null;
         let emergencyContacts = [];
@@ -225,6 +247,7 @@
         let recognition = null;
         let isListening = false;
         let micPermissionGranted = false;
+        let fatigueWasActive = false;
 
         function playClick() {
             if (!clickSound) return;
@@ -350,9 +373,14 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action, text })
-            }).catch(() => {
-                controlStatus.textContent = 'Failed to trigger action.';
-            });
+            })
+                .then(r => r.json())
+                .then(data => {
+                    controlStatus.textContent = data.message || data.status || 'Action completed.';
+                })
+                .catch(() => {
+                    controlStatus.textContent = 'Failed to trigger action.';
+                });
         }
 
         function confirmAction(action, el) {
@@ -403,8 +431,8 @@
             const configured = contact && contact.length > 5;
 
             if (configured) {
-                btnMsg.onclick = () => sendAction('emergency_contact');
-                btnDial.onclick = () => sendAction('emergency_call');
+                btnMsg.onclick = () => confirmAction('emergency_contact', btnMsg);
+                btnDial.onclick = () => confirmAction('emergency_call', btnDial);
             } else {
                 btnMsg.onclick = () => alert('Configure Number first!');
                 btnDial.onclick = () => alert('Configure Number first!');
@@ -496,7 +524,8 @@
         function loadEmergencyContacts() {
             let stored = [];
             try {
-                const raw = localStorage.getItem(CONTACTS_STORAGE_KEY);
+                const raw = localStorage.getItem(CONTACTS_STORAGE_KEY)
+                    || localStorage.getItem(LEGACY_CONTACTS_STORAGE_KEY);
                 stored = raw ? JSON.parse(raw) : [];
             } catch (e) {
                 stored = [];
@@ -505,6 +534,7 @@
             emergencyContacts = [...new Set((Array.isArray(stored) ? stored : [])
                 .map(sanitizePhoneNumber)
                 .filter(isValidPhoneNumber))];
+            saveContactsToStorage();
 
             if (emergencyContacts.length) {
                 setActiveEmergencyContact(emergencyContacts[0], true);
@@ -521,13 +551,20 @@
         function saveControlSettings() {
             const cursorSpeed = parseFloat(controlCursorSpeed.value);
             const blinkSensitivity = parseFloat(controlBlinkSensitivity.value);
+            const cursorScope = parseFloat(controlCursorScope.value);
+            const blinksRequired = parseInt(controlBlinksRequired.value, 10);
+            const blinkWindow = parseFloat(controlBlinkWindow.value);
             const lockDelay = parseFloat(controlLockDelay.value);
 
             localStorage.setItem(LOCK_DELAY_KEY, String(lockDelay));
 
             const payload = {
                 cursor_speed: cursorSpeed,
+                cursor_scope: cursorScope,
                 blink_sensitivity: blinkSensitivity,
+                blinks_to_click: blinksRequired,
+                blink_window: blinkWindow,
+                lock_delay: lockDelay,
                 emergency_contact: activeEmergencyContact || ''
             };
 
@@ -546,11 +583,24 @@
         }
 
         function loadControlSettings() {
-            const lockDelay = localStorage.getItem(LOCK_DELAY_KEY);
+            const lockDelay = localStorage.getItem(LOCK_DELAY_KEY)
+                || localStorage.getItem(LEGACY_LOCK_DELAY_KEY);
             if (lockDelay) {
                 controlLockDelay.value = lockDelay;
             }
             updateCursorSpeedLabel();
+            fetch('/settings')
+                .then(r => r.json())
+                .then(settings => {
+                    if (settings.cursor_speed != null) controlCursorSpeed.value = settings.cursor_speed;
+                    if (settings.cursor_scope != null) controlCursorScope.value = settings.cursor_scope;
+                    if (settings.blink_sensitivity != null) controlBlinkSensitivity.value = settings.blink_sensitivity;
+                    if (settings.blinks_to_click != null) controlBlinksRequired.value = settings.blinks_to_click;
+                    if (settings.blink_window != null) controlBlinkWindow.value = settings.blink_window;
+                    if (settings.lock_delay != null) controlLockDelay.value = settings.lock_delay;
+                    updateCursorSpeedLabel();
+                })
+                .catch(() => { });
         }
 
         function setMicVisualState(state, message) {
@@ -749,7 +799,9 @@
             fetch('/fatigue_status')
                 .then(r => r.json())
                 .then(data => {
-                    if (data.should_show_toast) {
+                    const newlyFatigued = data.is_fatigued && !fatigueWasActive;
+                    fatigueWasActive = Boolean(data.is_fatigued);
+                    if (newlyFatigued) {
                         fatigueToast.classList.remove('hidden');
                         fatigueToast.classList.add('visible');
                         setTimeout(() => {

@@ -1,5 +1,5 @@
 """
-Fatigue-Aware Blink Monitoring System for Senseway
+Fatigue-Aware Blink Monitoring System for OptiKinesis
 
 This module monitors blink patterns to detect user fatigue during extended
 eye-gaze interaction sessions. When fatigue is detected, it:

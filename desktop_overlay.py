@@ -1,5 +1,5 @@
 """
-Desktop Overlay UI Module for Intentix / SenseWay
+Desktop Overlay UI Module for OptiKinesis
 
 This module contains the PyQt5 floating overlay interface:
 - CursorOverlay (gaze ring indicator)
@@ -20,7 +20,10 @@ import numpy as np
 import cv2
 import pyautogui
 import ctypes
+import logging
 from ctypes import wintypes
+
+logger = logging.getLogger("optikinesis.overlay")
 
 try:
     from PyQt5 import QtWidgets, QtGui, QtCore, QtTest
@@ -38,15 +41,15 @@ BAR_IDLE_HEIGHT = 58
 BAR_EXPANDED_HEIGHT = 100
 BAR_HEIGHT = BAR_EXPANDED_HEIGHT
 PANEL_TOP_OFFSET = TOP_MARGIN + BAR_EXPANDED_HEIGHT + 14
-LOCK_DELAY = 2
+LOCK_DELAY = 0.5
 DEBUG_BLINK_HUD = False
 
 # Callbacks and data providers set by main.py
 _settings = {
-    "emergency_contact": "+919354139640",
+    "emergency_contact": "",
     "cursor_scope": 1.0,
     "blink_sensitivity": 0.2,
-    "cursor_speed": 0.15,
+    "cursor_speed": 0.5,
     "overlay_enabled": True,
     "mouse_control_enabled": True
 }
@@ -54,18 +57,24 @@ _action_executor = None
 _whatsapp_sender = None
 _frame_provider = None
 _voice_executor = None
+_fatigue_provider = None
+_shutdown_callback = None
 
 gaze_click_bridge = None
 cursor_overlay_widget = None
 blink_debug_overlay_widget = None
 keyboard_panel_widget = None
 mini_camera_widget = None
+notification_overlay_widget = None
+notification_bridge = None
 
 
 def configure_overlay(settings=None, action_executor=None, whatsapp_sender=None, 
-                      frame_provider=None, voice_executor=None, lock_delay=1.5, debug_hud=False):
+                      frame_provider=None, voice_executor=None, fatigue_provider=None,
+                      shutdown_callback=None, lock_delay=0.5, debug_hud=False):
     """Configure external callbacks and settings references from main application."""
-    global _settings, _action_executor, _whatsapp_sender, _frame_provider, _voice_executor, LOCK_DELAY, DEBUG_BLINK_HUD
+    global _settings, _action_executor, _whatsapp_sender, _frame_provider, _voice_executor
+    global _fatigue_provider, _shutdown_callback, LOCK_DELAY, DEBUG_BLINK_HUD
     if settings is not None:
         _settings = settings
     if action_executor is not None:
@@ -76,6 +85,10 @@ def configure_overlay(settings=None, action_executor=None, whatsapp_sender=None,
         _frame_provider = frame_provider
     if voice_executor is not None:
         _voice_executor = voice_executor
+    if fatigue_provider is not None:
+        _fatigue_provider = fatigue_provider
+    if shutdown_callback is not None:
+        _shutdown_callback = shutdown_callback
     LOCK_DELAY = lock_delay
     DEBUG_BLINK_HUD = debug_hud
 
@@ -90,6 +103,23 @@ def _send_whatsapp(number, message):
     if _whatsapp_sender:
         import threading
         threading.Thread(target=_whatsapp_sender, args=(number, message), daemon=True).start()
+
+
+def request_exit():
+    """Request Qt shutdown safely from callbacks or worker threads."""
+    if not PYQT5_AVAILABLE:
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        QtCore.QTimer.singleShot(0, app.quit)
+
+
+def dispatch_notification(message):
+    """Show a non-focus-stealing overlay notification from any thread."""
+    if PYQT5_AVAILABLE and notification_bridge is not None:
+        notification_bridge.message_requested.emit(str(message))
+    else:
+        logger.info("Notification: %s", message)
 
 
 if PYQT5_AVAILABLE:
@@ -135,7 +165,8 @@ if PYQT5_AVAILABLE:
 
         def draw_circle(self):
             img = np.zeros((self.diameter, self.diameter, 4), dtype=np.uint8)
-            cv2.circle(img, (self.radius + 2, self.radius + 2), self.radius - 5, (0, 255, 0, 255), 10)
+            color = (255, 97, 97, 255) if _settings.get("system_paused", False) else (0, 255, 0, 255)
+            cv2.circle(img, (self.radius + 2, self.radius + 2), self.radius - 5, color, 10)
             qimg = QtGui.QImage(img.data, self.diameter, self.diameter, QtGui.QImage.Format_RGBA8888)
             pixmap = QtGui.QPixmap.fromImage(qimg)
             self.label.setPixmap(pixmap)
@@ -196,6 +227,84 @@ if PYQT5_AVAILABLE:
 
         def set_message(self, text):
             self.label.setText(text)
+
+
+    class NotificationToastOverlay(QtWidgets.QWidget):
+        """Transient reminder/fatigue notification that never takes focus."""
+
+        def __init__(self):
+            super().__init__()
+            self.setWindowFlags(
+                QtCore.Qt.FramelessWindowHint
+                | QtCore.Qt.WindowStaysOnTopHint
+                | QtCore.Qt.Tool
+                | QtCore.Qt.WindowDoesNotAcceptFocus
+            )
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+            self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+            if hasattr(QtCore.Qt, "WindowTransparentForInput"):
+                self.setWindowFlag(QtCore.Qt.WindowTransparentForInput, True)
+
+            self.setFixedSize(min(680, SCREEN_W - 40), 94)
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.label = QtWidgets.QLabel(self)
+            self.label.setAlignment(QtCore.Qt.AlignCenter)
+            self.label.setWordWrap(True)
+            self.label.setStyleSheet("""
+                QLabel {
+                    background: rgba(45, 35, 14, 242);
+                    border: 2px solid #ffbc63;
+                    border-radius: 14px;
+                    color: #ffe4b8;
+                    font-size: 18px;
+                    font-weight: 700;
+                    padding: 12px;
+                }
+            """)
+            layout.addWidget(self.label)
+            self.move((SCREEN_W - self.width()) // 2, TOP_MARGIN + BAR_HEIGHT + 16)
+
+            self.hide_timer = QtCore.QTimer(self)
+            self.hide_timer.setSingleShot(True)
+            self.hide_timer.timeout.connect(self.hide)
+
+            self._was_fatigued = False
+            self.fatigue_timer = QtCore.QTimer(self)
+            self.fatigue_timer.timeout.connect(self._poll_fatigue)
+            self.fatigue_timer.start(500)
+            self.hide()
+
+        @QtCore.pyqtSlot(str)
+        def show_message(self, message):
+            self.label.setText(message)
+            self.show()
+            self.raise_()
+            self.hide_timer.start(5000)
+
+        def _poll_fatigue(self):
+            if _fatigue_provider is None:
+                return
+            try:
+                state = _fatigue_provider() or {}
+                is_fatigued = bool(state.get("is_fatigued"))
+                if is_fatigued and not self._was_fatigued:
+                    self.show_message(
+                        "Fatigue detected: blink control is less sensitive. "
+                        "Please rest your eyes when it is safe."
+                    )
+                self._was_fatigued = is_fatigued
+            except Exception as exc:
+                logger.debug("Fatigue status check failed: %s", exc)
+
+
+    class NotificationBridge(QtCore.QObject):
+        message_requested = QtCore.pyqtSignal(str)
+
+        def __init__(self, toast):
+            super().__init__()
+            self.message_requested.connect(toast.show_message, QtCore.Qt.QueuedConnection)
 
 
     class DraggableOverlayWidget(QtWidgets.QWidget):
@@ -329,6 +438,8 @@ if PYQT5_AVAILABLE:
             self.caps_btn = None
             self.shift_buttons = []
             self.dynamic_buttons = []
+            self.active_modifiers = set()
+            self.modifier_buttons = {}
 
             wrapper = QtWidgets.QHBoxLayout()
             wrapper.setContentsMargins(0, 0, 0, 0)
@@ -563,6 +674,8 @@ if PYQT5_AVAILABLE:
                 self.caps_btn = btn
             if key == "Shift":
                 self.shift_buttons.append(btn)
+            if key in {"Ctrl", "Alt", "Win"}:
+                self.modifier_buttons[key] = btn
 
             if (len(key) == 1 and key.isprintable()) or shift_symbol is not None:
                 self.dynamic_buttons.append((btn, key, shift_symbol))
@@ -571,7 +684,7 @@ if PYQT5_AVAILABLE:
 
         def _display_for_key(self, key, shift_symbol=None):
             if len(key) == 1 and key.isalpha():
-                return key.upper() if (self.caps_lock or self.shift) else key.lower()
+                return key.upper() if (self.caps_lock ^ self.shift) else key.lower()
             if self.shift and shift_symbol:
                 return shift_symbol
             return key
@@ -596,8 +709,48 @@ if PYQT5_AVAILABLE:
                 btn.setProperty("active", self.shift)
                 btn.style().unpolish(btn)
                 btn.style().polish(btn)
+            for key, btn in self.modifier_buttons.items():
+                btn.setProperty("active", key in self.active_modifiers)
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+
+        def _consume_modifiers(self, key):
+            if not self.active_modifiers:
+                return False
+            key_map = {
+                "Backspace": "backspace", "Tab": "tab", "Enter": "enter",
+                "Space": "space", "Left": "left", "Right": "right",
+            }
+            target = key_map.get(key, str(key).lower())
+            modifiers = [name.lower() for name in ("Ctrl", "Alt", "Win") if name in self.active_modifiers]
+            if self.shift:
+                modifiers.append("shift")
+            try:
+                pyautogui.hotkey(*modifiers, target)
+            except Exception as exc:
+                logger.warning("Virtual keyboard shortcut failed: %s", exc)
+            self.active_modifiers.clear()
+            self.shift = False
+            self._refresh_modifier_visuals()
+            self._refresh_key_labels()
+            return True
 
         def _on_key_press(self, key, shift_symbol=None):
+            if key in {"Ctrl", "Alt", "Win"}:
+                if key in self.active_modifiers:
+                    self.active_modifiers.remove(key)
+                else:
+                    self.active_modifiers.add(key)
+                self._refresh_modifier_visuals()
+                return
+            if key == "Menu":
+                try:
+                    pyautogui.press("apps")
+                except Exception as exc:
+                    logger.warning("Virtual keyboard menu key failed: %s", exc)
+                return
+            if key not in {"Caps", "Shift", "Clear"} and self._consume_modifiers(key):
+                return
             if key == "Backspace":
                 self.backspace()
                 return
@@ -633,9 +786,6 @@ if PYQT5_AVAILABLE:
             if key == "Right":
                 self.move_cursor(1)
                 return
-            if key in {"Ctrl", "Alt", "Win", "Menu"}:
-                return
-
             self.insert_text(self._resolve_char(key, shift_symbol))
             if self.shift:
                 self.shift = False
@@ -647,31 +797,50 @@ if PYQT5_AVAILABLE:
 
         def insert_text(self, value):
             try:
-                pyautogui.write(value)
-            except Exception:
-                pass
+                cursor = self.text_area.textCursor()
+                cursor.insertText(value)
+                self.text_area.setTextCursor(cursor)
+                if value == "\n":
+                    pyautogui.press("enter")
+                elif value == "\t":
+                    pyautogui.press("tab")
+                else:
+                    pyautogui.write(value)
+            except Exception as exc:
+                logger.warning("Virtual keyboard typing failed: %s", exc)
 
         def backspace(self):
             try:
+                cursor = self.text_area.textCursor()
+                if cursor.hasSelection():
+                    cursor.removeSelectedText()
+                elif cursor.position() > 0:
+                    cursor.deletePreviousChar()
+                self.text_area.setTextCursor(cursor)
                 pyautogui.press('backspace')
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Virtual keyboard backspace failed: %s", exc)
 
         def clear_text(self):
             try:
+                self.text_area.clear()
                 pyautogui.hotkey('ctrl', 'a')
                 pyautogui.press('backspace')
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Virtual keyboard clear failed: %s", exc)
 
         def move_cursor(self, delta):
             try:
+                cursor = self.text_area.textCursor()
                 if delta < 0:
+                    cursor.movePosition(QtGui.QTextCursor.Left, n=abs(delta))
                     pyautogui.press('left', presses=abs(delta))
                 else:
+                    cursor.movePosition(QtGui.QTextCursor.Right, n=delta)
                     pyautogui.press('right', presses=delta)
-            except Exception:
-                pass
+                self.text_area.setTextCursor(cursor)
+            except Exception as exc:
+                logger.warning("Virtual keyboard cursor move failed: %s", exc)
 
 
     class CameraOverlayPanel(OverlayPanelBase):
@@ -702,7 +871,6 @@ if PYQT5_AVAILABLE:
             if frame is None:
                 return
 
-            frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, c = rgb.shape
             qimg = QtGui.QImage(rgb.data, w, h, c * w, QtGui.QImage.Format_RGB888)
@@ -752,7 +920,6 @@ if PYQT5_AVAILABLE:
             if frame is None:
                 return
 
-            frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, c = rgb.shape
             qimg = QtGui.QImage(rgb.data, w, h, c * w, QtGui.QImage.Format_RGB888)
@@ -821,12 +988,42 @@ if PYQT5_AVAILABLE:
 
             emergency_btn("MSG CONTACT", self.msg_contact, 0, 0)
             emergency_btn("CALL CONTACT", self.call_contact, 0, 1)
-            emergency_btn("DIAL 100", lambda: _perform_action("emergency_police"), 1, 0)
-            emergency_btn("DIAL 112", lambda: _perform_action("emergency_ambulance"), 1, 1)
+            emergency_btn(
+                "DIAL 100",
+                lambda: self.confirm_emergency(
+                    "police", lambda: _perform_action("emergency_police")
+                ),
+                1,
+                0,
+            )
+            emergency_btn(
+                "DIAL 112",
+                lambda: self.confirm_emergency(
+                    "ambulance", lambda: _perform_action("emergency_ambulance")
+                ),
+                1,
+                1,
+            )
 
             self.status = QtWidgets.QLabel("Emergency actions ready.", self.body)
             self.status.setStyleSheet("color:#9fb6cf; font-size:18px;")
             self.body_layout.addWidget(self.status)
+            self._pending_emergency = None
+            self._pending_until = 0.0
+
+        def confirm_emergency(self, action_name, callback):
+            now = time.time()
+            if self._pending_emergency != action_name or now > self._pending_until:
+                self._pending_emergency = action_name
+                self._pending_until = now + 5.0
+                self.status.setText(
+                    f"Safety check: activate {action_name.upper()} again within 5 seconds."
+                )
+                return
+            self._pending_emergency = None
+            self._pending_until = 0.0
+            callback()
+            self.status.setText(f"Emergency {action_name} action triggered.")
 
         def save_contact(self):
             value = self.contact_input.text().strip()
@@ -834,6 +1031,7 @@ if PYQT5_AVAILABLE:
                 self.status.setText("Enter a valid contact number.")
                 return
             _settings["emergency_contact"] = value
+            _perform_action("save_settings")
             self.status.setText(f"Emergency contact saved: {value}")
 
         def msg_contact(self):
@@ -841,16 +1039,22 @@ if PYQT5_AVAILABLE:
             if not _settings.get("emergency_contact"):
                 self.status.setText("Set contact before sending message.")
                 return
-            _send_whatsapp(_settings["emergency_contact"], "SOS! I need help. Sent via Intentix.")
-            self.status.setText("Emergency message flow started.")
+            self.confirm_emergency(
+                "message",
+                lambda: _send_whatsapp(
+                    _settings["emergency_contact"],
+                    "SOS! I need help. Sent via OptiKinesis.",
+                ),
+            )
 
         def call_contact(self):
             self.save_contact()
             if not _settings.get("emergency_contact"):
                 self.status.setText("Set contact before calling.")
                 return
-            _perform_action("emergency_call")
-            self.status.setText("Emergency call triggered.")
+            self.confirm_emergency(
+                "contact call", lambda: _perform_action("emergency_call")
+            )
 
 
     class ControlOverlayPanel(OverlayPanelBase):
@@ -860,29 +1064,46 @@ if PYQT5_AVAILABLE:
             super().__init__("CONTROL MODULE", width=min(1100, int(SCREEN_W * 0.72)), height=min(760, int(SCREEN_H * 0.72)))
 
             self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, self.body)
-            self.speed_slider.setRange(3, 15)
+            self.speed_slider.setRange(1, 15)
             self.speed_slider.setValue(int(_settings.get("cursor_speed", 0.5) * 10))
+
+            self.scope_spin = QtWidgets.QDoubleSpinBox(self.body)
+            self.scope_spin.setRange(0.35, 2.0)
+            self.scope_spin.setSingleStep(0.05)
+            self.scope_spin.setValue(float(_settings.get("cursor_scope", 1.0)))
 
             self.blink_spin = QtWidgets.QDoubleSpinBox(self.body)
             self.blink_spin.setRange(0.15, 0.35)
             self.blink_spin.setSingleStep(0.01)
             self.blink_spin.setValue(float(_settings.get("blink_sensitivity", 0.2)))
 
+            self.blinks_required_spin = QtWidgets.QSpinBox(self.body)
+            self.blinks_required_spin.setRange(1, 2)
+            self.blinks_required_spin.setValue(int(_settings.get("blinks_to_click", 2)))
+
+            self.blink_window_spin = QtWidgets.QDoubleSpinBox(self.body)
+            self.blink_window_spin.setRange(0.5, 3.0)
+            self.blink_window_spin.setSingleStep(0.1)
+            self.blink_window_spin.setValue(float(_settings.get("blink_window", 1.5)))
+
             self.lock_delay_spin = QtWidgets.QDoubleSpinBox(self.body)
             self.lock_delay_spin.setRange(0.5, 5.0)
             self.lock_delay_spin.setSingleStep(0.1)
-            self.lock_delay_spin.setValue(LOCK_DELAY)
+            self.lock_delay_spin.setValue(float(_settings.get("lock_delay", LOCK_DELAY)))
 
             self.status = QtWidgets.QLabel("Control settings ready.", self.body)
             self.status.setStyleSheet("color:#9fb6cf; font-size:18px;")
 
             for label_text, widget in [
                 ("Cursor Speed", self.speed_slider),
+                ("Cursor Scope (lower = more sensitive)", self.scope_spin),
                 ("Blink Sensitivity", self.blink_spin),
-                ("Lock Delay (seconds)", self.lock_delay_spin),
+                ("Deliberate Blinks Per Click", self.blinks_required_spin),
+                ("Blink Sequence Window (seconds)", self.blink_window_spin),
+                ("Post-click Lock Delay (seconds)", self.lock_delay_spin),
             ]:
                 label = QtWidgets.QLabel(label_text, self.body)
-                label.setStyleSheet("color:#d8e8f9; font-size:20px; font-weight:600;")
+                label.setStyleSheet("color:#d8e8f9; font-size:16px; font-weight:600;")
                 self.body_layout.addWidget(label)
                 self.body_layout.addWidget(widget)
 
@@ -901,8 +1122,23 @@ if PYQT5_AVAILABLE:
             mouse_btn.clicked.connect(lambda: self.toggle_setting("mouse_control_enabled"))
             btn_row.addWidget(mouse_btn)
 
-            for btn in (save_btn, overlay_btn, mouse_btn):
-                btn.setMinimumHeight(62)
+            safety_row = QtWidgets.QHBoxLayout()
+            self.body_layout.addLayout(safety_row)
+
+            calibrate_btn = QtWidgets.QPushButton("CALIBRATE CENTER")
+            calibrate_btn.clicked.connect(self.calibrate)
+            safety_row.addWidget(calibrate_btn)
+
+            pause_btn = QtWidgets.QPushButton("PAUSE / RESUME (F12)")
+            pause_btn.clicked.connect(self.toggle_pause)
+            safety_row.addWidget(pause_btn)
+
+            exit_btn = QtWidgets.QPushButton("EXIT OPTIKINESIS")
+            exit_btn.clicked.connect(self.exit_application)
+            safety_row.addWidget(exit_btn)
+
+            for btn in (save_btn, overlay_btn, mouse_btn, calibrate_btn, pause_btn, exit_btn):
+                btn.setMinimumHeight(52)
                 btn.setStyleSheet("""
                     border: 2px solid #355173;
                     border-radius: 12px;
@@ -912,20 +1148,42 @@ if PYQT5_AVAILABLE:
                     font-weight: 700;
                     padding: 0 12px;
                 """)
+            exit_btn.setStyleSheet(exit_btn.styleSheet() + "QPushButton { border-color:#8b3a3a; color:#ffd4d4; }")
 
             self.body_layout.addWidget(self.status)
 
         def save_settings(self):
             global LOCK_DELAY
             _settings["cursor_speed"] = float(self.speed_slider.value()) / 10.0
+            _settings["cursor_scope"] = float(self.scope_spin.value())
             _settings["blink_sensitivity"] = float(self.blink_spin.value())
+            _settings["blinks_to_click"] = int(self.blinks_required_spin.value())
+            _settings["blink_window"] = float(self.blink_window_spin.value())
             LOCK_DELAY = float(self.lock_delay_spin.value())
-            self.status.setText("Control settings saved.")
+            _settings["lock_delay"] = LOCK_DELAY
+            result = _perform_action("save_settings")
+            self.status.setText(
+                "Control settings saved." if result.get("status") == "saved" else "Could not save settings."
+            )
 
         def toggle_setting(self, key):
             _settings[key] = not _settings.get(key, True)
+            _perform_action("save_settings")
             state = "ON" if _settings[key] else "OFF"
             self.status.setText(f"{key} is now {state}.")
+
+        def calibrate(self):
+            result = _perform_action("calibrate")
+            self.status.setText(result.get("message", result.get("status", "Calibration requested")))
+
+        def toggle_pause(self):
+            result = _perform_action("toggle_pause")
+            paused = result.get("system_paused", False)
+            self.status.setText("SYSTEM PAUSED" if paused else "System resumed.")
+
+        def exit_application(self):
+            _perform_action("exit_application")
+            request_exit()
 
 
     class FloatingControlBar(DraggableOverlayWidget):
@@ -989,7 +1247,7 @@ if PYQT5_AVAILABLE:
             exp_layout.setSpacing(10)
 
             # Brand label
-            brand = QtWidgets.QLabel("●  INTENTIX")
+            brand = QtWidgets.QLabel("●  OPTIKINESIS")
             brand.setObjectName("brandLabel")
             exp_layout.addWidget(brand)
 
@@ -1371,13 +1629,16 @@ if PYQT5_AVAILABLE:
                     h_ibeam = ctypes.windll.user32.LoadCursorW(None, 32513)
                     if info.hCursor == h_ibeam:
                         is_text_box = True
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("I-beam cursor detection unavailable: %s", exc)
 
             try:
                 pyautogui.click(x=int(x), y=int(y))
-            except Exception:
-                pass
+            except pyautogui.FailSafeException:
+                _settings["system_paused"] = True
+                logger.warning("OS click cancelled by PyAutoGUI failsafe; system paused")
+            except Exception as exc:
+                logger.warning("OS click failed: %s", exc)
             finally:
                 for w in hidden:
                     if _settings.get("overlay_enabled", True) or not isinstance(w, CursorOverlay):
@@ -1444,22 +1705,32 @@ def dispatch_blink_click(x=None, y=None):
             x, y = CENTER_X, CENTER_Y
     try:
         pyautogui.click(x=int(x), y=int(y))
-    except Exception:
-        pass
+    except pyautogui.FailSafeException:
+        _settings["system_paused"] = True
+        logger.warning("Blink click cancelled by PyAutoGUI failsafe; system paused")
+    except Exception as exc:
+        logger.warning("Blink click failed: %s", exc)
 
 
 def launch_overlay():
     """Initialize and launch the PyQt5 overlay application."""
-    global gaze_click_bridge, cursor_overlay_widget, blink_debug_overlay_widget, keyboard_panel_widget, mini_camera_widget
+    global gaze_click_bridge, cursor_overlay_widget, blink_debug_overlay_widget
+    global keyboard_panel_widget, mini_camera_widget
+    global notification_overlay_widget, notification_bridge
 
     if not PYQT5_AVAILABLE:
         print("ERROR: PyQt5 is required for system-level overlay mode.")
         print("Install with: pip install PyQt5")
         sys.exit(1)
 
-    qt_app = QtWidgets.QApplication(sys.argv)
+    qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([sys.argv[0]])
     qt_app.setQuitOnLastWindowClosed(False)
+    if _shutdown_callback is not None:
+        qt_app.aboutToQuit.connect(_shutdown_callback)
     gaze_click_bridge = GazeClickBridge()
+
+    notification_overlay_widget = NotificationToastOverlay()
+    notification_bridge = NotificationBridge(notification_overlay_widget)
 
     cursor_overlay_widget = CursorOverlay(radius=80)
     cursor_overlay_widget.show()
@@ -1476,7 +1747,6 @@ def launch_overlay():
     mini_camera_widget = MiniCameraOverlay()
     mini_camera_widget.show()
 
-    global keyboard_panel_widget
     keyboard_panel = KeyboardOverlayPanel()
     keyboard_panel_widget = keyboard_panel
     camera_panel = CameraOverlayPanel()

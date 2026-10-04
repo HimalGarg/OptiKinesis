@@ -12,7 +12,42 @@ import time
 import urllib.parse
 import sys
 import os
+import json
+import atexit
+import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 from collections import deque
+
+from blink_detector import DeliberateBlinkDetector
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+LOG_PATH = os.path.join(BASE_DIR, "optikinesis.log")
+
+
+def configure_logging():
+    """Configure one console and one bounded file log for all modules."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    root.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(threadName)s: %(message)s"
+    )
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+
+configure_logging()
+logger = logging.getLogger("optikinesis")
 
 # --- PyQt5 IMPORTS FOR NATIVE OVERLAY ---
 try:
@@ -39,7 +74,7 @@ from voice_commands import voice_executor
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-pyautogui.FAILSAFE = False
+pyautogui.FAILSAFE = True
 
 # Screen settings
 SCREEN_W, SCREEN_H = pyautogui.size()
@@ -65,8 +100,8 @@ INVERT_Y = False   # Invert vertical (usually not needed)
 BLINK_THRESH = 0.2
 BLINK_DURATION_MIN = 0.15  # Minimum blink hold time (150ms)
 BLINK_COOLDOWN = 0.25      # Time between blinks
-BLINKS_TO_CLICK = 2        # Require 2 blinks to trigger click
-BLINK_WINDOW = 1.5         # 1.5 second window to complete 2 blinks
+BLINKS_TO_CLICK = 1        # Require 1 blink to trigger click
+BLINK_WINDOW = 1.0         # 1.0 second window to complete blink
 
 # Face landmark indices for bounding box (from MonitorTracking.py)
 LANDMARKS = {
@@ -77,15 +112,74 @@ LANDMARKS = {
     "front": 1,
 }
 
-# Configurable Settings
-SETTINGS = {
-    "emergency_contact": "+916387533207",
+# Configurable settings.  User changes are persisted to settings.json.
+DEFAULT_SETTINGS = {
+    "emergency_contact": "",
     "cursor_scope": 1.0,
     "blink_sensitivity": BLINK_THRESH,
-    "cursor_speed": 0.15,  # Ultra slow for users with severe medical conditions
+    "cursor_speed": 0.5,
+    "blinks_to_click": BLINKS_TO_CLICK,
+    "blink_window": BLINK_WINDOW,
+    "lock_delay": 0.5,
     "overlay_enabled": True,
-    "mouse_control_enabled": True
+    "mouse_control_enabled": True,
+    "system_paused": False,
 }
+
+
+def load_settings():
+    settings = DEFAULT_SETTINGS.copy()
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as stream:
+            stored = json.load(stream)
+        if isinstance(stored, dict):
+            settings.update({key: stored[key] for key in settings.keys() & stored.keys()})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Could not load settings: %s", exc)
+    # A safety pause is session state, not a preference.
+    settings["system_paused"] = False
+    return settings
+
+
+def save_settings():
+    temporary_path = SETTINGS_PATH + ".tmp"
+    try:
+        persisted = {
+            key: SETTINGS[key]
+            for key in DEFAULT_SETTINGS
+            if key != "system_paused"
+        }
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(persisted, stream, indent=2, sort_keys=True)
+        os.replace(temporary_path, SETTINGS_PATH)
+        return True
+    except OSError as exc:
+        logger.error("Could not save settings: %s", exc)
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+        return False
+
+
+SETTINGS = load_settings()
+
+
+def coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError("Expected a boolean value")
 
 # EMA smoothing for cursor position
 prev_screen_x = CENTER_X
@@ -94,6 +188,8 @@ prev_screen_y = CENTER_Y
 # Calibration offsets
 calibration_offset_yaw = 0
 calibration_offset_pitch = 0
+latest_raw_yaw = None
+latest_raw_pitch = None
 calibration_lock = threading.Lock()
 
 # Ray smoothing buffers
@@ -109,7 +205,7 @@ latest_preview_frame = None
 latest_preview_lock = threading.Lock()
 
 # UI-only setting for keyboard lock delay indicator
-LOCK_DELAY = 1.5
+LOCK_DELAY = float(SETTINGS.get("lock_delay", 0.5))
 
 # Debug HUD for blink->click routing
 DEBUG_BLINK_HUD = False
@@ -119,12 +215,32 @@ gaze_click_bridge = None
 cursor_overlay_widget = None
 blink_debug_overlay_widget = None
 
+# Lifecycle and face-presence state
+shutdown_event = threading.Event()
+cleanup_lock = threading.Lock()
+worker_threads = []
+tracking_state_lock = threading.Lock()
+last_face_seen = 0.0
+FACE_LOSS_TIMEOUT = 0.5
+
 # --- TWILIO CREDENTIALS (Optional) ---
 from dotenv import load_dotenv  # pyright: ignore[reportMissingImports]
 load_dotenv()
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
 TWILIO_PHONE = os.getenv("TWILIO_PHONE")
+
+SMTP_CONFIG = {
+    "smtp_server": os.getenv("SMTP_SERVER"),
+    "smtp_port": os.getenv("SMTP_PORT"),
+    "email": os.getenv("SMTP_EMAIL"),
+    "password": os.getenv("SMTP_PASSWORD"),
+}
+if all(SMTP_CONFIG.values()):
+    voice_executor.configure_email(SMTP_CONFIG)
+    logger.info("SMTP email integration configured for %s", SMTP_CONFIG["email"])
+else:
+    logger.info("SMTP email integration is not configured")
 
 # --- DESKTOP OVERLAY MODULE ---
 import desktop_overlay
@@ -135,25 +251,66 @@ def get_latest_preview_frame():
         return None if latest_preview_frame is None else latest_preview_frame.copy()
 
 
+def is_face_tracking_active():
+    with tracking_state_lock:
+        return time.time() - last_face_seen <= FACE_LOSS_TIMEOUT
+
+
+def mark_face_seen():
+    global last_face_seen
+    with tracking_state_lock:
+        last_face_seen = time.time()
+
+
+def calibrate_current_pose():
+    """Map the most recently observed neutral head pose to screen center."""
+    global calibration_offset_yaw, calibration_offset_pitch
+    with calibration_lock:
+        if latest_raw_yaw is None or latest_raw_pitch is None:
+            return False
+        calibration_offset_yaw = 180.0 - latest_raw_yaw
+        calibration_offset_pitch = 180.0 - latest_raw_pitch
+    logger.info(
+        "Calibrated center: yaw offset %.2f, pitch offset %.2f",
+        calibration_offset_yaw,
+        calibration_offset_pitch,
+    )
+    return True
+
+
 # --- MOUSE MOVER THREAD ---
 def mouse_mover():
     """Continuously move mouse to target position (smoother than direct control in main loop)."""
-    while True:
-        if SETTINGS.get("mouse_control_enabled", True):
+    while not shutdown_event.is_set():
+        if (
+            SETTINGS.get("mouse_control_enabled", True)
+            and not SETTINGS.get("system_paused", False)
+            and is_face_tracking_active()
+        ):
             with mouse_lock:
                 x, y = mouse_target
             try:
                 if not (math.isnan(x) or math.isnan(y)):
                     pyautogui.moveTo(x, y)
-            except Exception:
-                pass
-        time.sleep(0.01)
+            except pyautogui.FailSafeException:
+                SETTINGS["system_paused"] = True
+                logger.warning("PyAutoGUI failsafe activated; system paused")
+            except Exception as exc:
+                logger.debug("Mouse movement failed: %s", exc)
+        shutdown_event.wait(0.01)
 
 
 # --- HELPERS ---
 def landmark_to_np(landmark, w, h):
     """Convert MediaPipe landmark to numpy array with pixel coordinates."""
     return np.array([landmark.x * w, landmark.y * h, landmark.z * w])
+
+
+def normalize_vector(vector):
+    norm = np.linalg.norm(vector)
+    if not np.isfinite(norm) or norm < 1e-8:
+        return None
+    return vector / norm
 
 
 def make_twilio_call():
@@ -179,21 +336,36 @@ def auto_send_whatsapp(number, message):
     msg_encoded = urllib.parse.quote(message)
     link = f"https://web.whatsapp.com/send?phone={number}&text={msg_encoded}"
     webbrowser.open(link)
-    time.sleep(20)
-    pyautogui.press('enter')
-    time.sleep(1)
-    pyautogui.press('enter')
+    try:
+        delay = max(3.0, float(os.getenv("WHATSAPP_SEND_DELAY", "12")))
+    except ValueError:
+        delay = 12.0
+    if not shutdown_event.wait(delay):
+        # This remains a best-effort browser integration.  The native UI asks
+        # for confirmation before reaching this point.
+        try:
+            pyautogui.press('enter')
+        except pyautogui.FailSafeException:
+            SETTINGS["system_paused"] = True
+            logger.warning("WhatsApp send cancelled by PyAutoGUI failsafe")
 
 
 def execute_type_external(text):
-    time.sleep(5)
-    pyautogui.write(text, interval=0.1)
+    if not shutdown_event.wait(5):
+        try:
+            pyautogui.write(text, interval=0.1)
+        except pyautogui.FailSafeException:
+            SETTINGS["system_paused"] = True
+            logger.warning("External typing cancelled by PyAutoGUI failsafe")
 
 
 def perform_action_internal(action, text=""):
     """Execute system/browser/emergency action from both web and native UI."""
     contact_num = SETTINGS["emergency_contact"]
-    msg_body = "SOS! I need help. Sent via Intentix."
+    msg_body = "SOS! I need help. Sent via OptiKinesis."
+
+    if action in {"emergency_contact", "dial_contact", "emergency_call"} and not contact_num:
+        return {"status": "error", "message": "Configure an emergency contact first"}
 
     if action == 'google':
         webbrowser.open(f"https://www.google.com/search?q={urllib.parse.quote(text)}")
@@ -215,10 +387,33 @@ def perform_action_internal(action, text=""):
         webbrowser.open("tel:112")
     elif action == 'toggle_overlay':
         SETTINGS['overlay_enabled'] = not SETTINGS.get('overlay_enabled', True)
+        save_settings()
         return {"status": "toggled", "overlay_enabled": SETTINGS['overlay_enabled']}
     elif action == 'toggle_mouse':
         SETTINGS['mouse_control_enabled'] = not SETTINGS.get('mouse_control_enabled', True)
+        save_settings()
         return {"status": "toggled", "mouse_control_enabled": SETTINGS['mouse_control_enabled']}
+    elif action == 'toggle_pause':
+        SETTINGS['system_paused'] = not SETTINGS.get('system_paused', False)
+        desktop_overlay.dispatch_notification(
+            "SYSTEM PAUSED - press F12 to resume"
+            if SETTINGS['system_paused']
+            else "OptiKinesis resumed"
+        )
+        return {"status": "toggled", "system_paused": SETTINGS['system_paused']}
+    elif action == 'calibrate':
+        calibrated = calibrate_current_pose()
+        return {
+            "status": "calibrated" if calibrated else "error",
+            "message": "Calibration complete" if calibrated else "No face pose is available yet",
+        }
+    elif action == 'save_settings':
+        return {"status": "saved" if save_settings() else "error"}
+    elif action == 'exit_application':
+        shutdown_event.set()
+        save_settings()
+        desktop_overlay.request_exit()
+        return {"status": "exiting"}
 
     return {"status": "ok"}
 
@@ -236,57 +431,102 @@ def get_blink_ratio(landmarks, eye_indices):
     return ver_dist / hor_dist if hor_dist != 0 else 0
 
 
-# --- MEDIAPIPE SETUP (Tasks API for 0.10.30+) ---
-# Download the face landmarker model if not present
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+# --- MEDIAPIPE/CAMERA SETUP (initialized only when the app starts) ---
+MODEL_PATH = os.path.join(BASE_DIR, "face_landmarker.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+face_landmarker = None
+cap = None
 
-if not os.path.exists(MODEL_PATH):
-    print(f"Downloading face landmarker model to {MODEL_PATH}...")
-    import urllib.request
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("Download complete!")
 
-# Create Face Landmarker
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-options = vision.FaceLandmarkerOptions(
-    base_options=base_options,
-    output_face_blendshapes=False,
-    output_facial_transformation_matrixes=False,
-    num_faces=1,
-    min_face_detection_confidence=0.5,
-    min_face_presence_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-face_landmarker = vision.FaceLandmarker.create_from_options(options)
+def initialize_hardware():
+    global face_landmarker, cap
+    if not os.path.exists(MODEL_PATH):
+        logger.info("Downloading face landmarker model to %s", MODEL_PATH)
+        import urllib.request
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
-print("Initializing Camera...")
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("ERROR: Camera 0 could not be opened. Trying 1...")
-    cap = cv2.VideoCapture(1)
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    face_landmarker = vision.FaceLandmarker.create_from_options(options)
+
+    for camera_index in (0, 1):
+        candidate = cv2.VideoCapture(camera_index)
+        if candidate.isOpened():
+            cap = candidate
+            logger.info("Using camera %d", camera_index)
+            return True
+        candidate.release()
+    logger.error("No usable camera was found")
+    cap = None
+    return False
+
+
+def cleanup_resources():
+    """Stop worker loops and release camera/native model resources once."""
+    shutdown_event.set()
+    with cleanup_lock:
+        if getattr(cleanup_resources, "_completed", False):
+            return
+        cleanup_resources._completed = True
+        current_thread = threading.current_thread()
+        for worker in list(worker_threads):
+            if worker is not current_thread and worker.is_alive():
+                worker.join(timeout=1.5)
+        try:
+            if cap is not None and cap.isOpened():
+                cap.release()
+        except Exception as exc:
+            logger.warning("Camera cleanup failed: %s", exc)
+        try:
+            if face_landmarker is not None:
+                face_landmarker.close()
+        except Exception as exc:
+            logger.warning("MediaPipe cleanup failed: %s", exc)
+        try:
+            voice_executor.reminder_scheduler.cancel_all()
+        except Exception as exc:
+            logger.warning("Reminder cleanup failed: %s", exc)
+        logger.info("OptiKinesis resources released")
+
+
+atexit.register(cleanup_resources)
 
 
 def gen_frames(stream_output=True):
     """Generate video frames with head-pose tracking (from MonitorTracking.py)."""
     global calibration_offset_yaw, calibration_offset_pitch, latest_preview_frame
+    global latest_raw_yaw, latest_raw_pitch
 
-    # Blink State
-    blink_start_time = 0
-    last_click_time = 0
-    blink_active = False
-    blink_freeze = False     # Freeze cursor during blink to prevent drift
+    if cap is None or face_landmarker is None:
+        logger.error("Tracking requested before hardware initialization")
+        return
+
+    blink_detector = DeliberateBlinkDetector(
+        min_duration=BLINK_DURATION_MIN,
+        max_duration=1.2,
+        blinks_required=int(SETTINGS.get("blinks_to_click", BLINKS_TO_CLICK)),
+        blink_window=float(SETTINGS.get("blink_window", BLINK_WINDOW)),
+        click_cooldown=float(SETTINGS.get("lock_delay", BLINK_COOLDOWN)),
+    )
+    blink_freeze = False
     blink_cursor_pos = (CENTER_X, CENTER_Y)  # Pre-blink cursor position for click
-    blink_count = 0          # Count blinks in window
-    blink_timestamps = []    # Track blink times for 3-blink detection
     LEFT_EYE = [33, 159, 133, 145]
+    RIGHT_EYE = [362, 386, 263, 374]
 
     print("Camera Loop Started with Head-Pose Tracking.")
 
-    while True:
+    while not shutdown_event.is_set():
         success, frame = cap.read()
         if not success:
-            time.sleep(0.1)
+            shutdown_event.wait(0.1)
             continue
 
         h, w, _ = frame.shape
@@ -298,6 +538,7 @@ def gen_frames(stream_output=True):
         results = face_landmarker.detect(mp_image)
 
         if results.face_landmarks and len(results.face_landmarks) > 0:
+            mark_face_seen()
             face_landmarks = results.face_landmarks[0]
 
             # --- HEAD-POSE TRACKING (from MonitorTracking.py) ---
@@ -317,14 +558,14 @@ def gen_frames(stream_output=True):
             front = key_points["front"]
 
             # Compute oriented axes based on head geometry
-            right_axis = (right - left)
-            right_axis /= np.linalg.norm(right_axis)
+            right_axis = normalize_vector(right - left)
+            up_axis = normalize_vector(top - bottom)
+            if right_axis is None or up_axis is None:
+                continue
 
-            up_axis = (top - bottom)
-            up_axis /= np.linalg.norm(up_axis)
-
-            forward_axis = np.cross(right_axis, up_axis)
-            forward_axis /= np.linalg.norm(forward_axis)
+            forward_axis = normalize_vector(np.cross(right_axis, up_axis))
+            if forward_axis is None:
+                continue
             forward_axis = -forward_axis  # Flip to face outward
 
             # Compute center of the head
@@ -336,22 +577,27 @@ def gen_frames(stream_output=True):
 
             # Compute averaged ray direction
             avg_origin = np.mean(ray_origins, axis=0)
-            avg_direction = np.mean(ray_directions, axis=0)
-            avg_direction /= np.linalg.norm(avg_direction)
+            avg_direction = normalize_vector(np.mean(ray_directions, axis=0))
+            if avg_direction is None:
+                continue
 
             # Reference forward direction
             reference_forward = np.array([0, 0, -1])
 
             # Horizontal (yaw) angle
             xz_proj = np.array([avg_direction[0], 0, avg_direction[2]])
-            xz_proj /= np.linalg.norm(xz_proj)
+            xz_proj = normalize_vector(xz_proj)
+            if xz_proj is None:
+                continue
             yaw_rad = math.acos(np.clip(np.dot(reference_forward, xz_proj), -1.0, 1.0))
             if avg_direction[0] < 0:
                 yaw_rad = -yaw_rad
 
             # Vertical (pitch) angle
             yz_proj = np.array([0, avg_direction[1], avg_direction[2]])
-            yz_proj /= np.linalg.norm(yz_proj)
+            yz_proj = normalize_vector(yz_proj)
+            if yz_proj is None:
+                continue
             pitch_rad = math.acos(np.clip(np.dot(reference_forward, yz_proj), -1.0, 1.0))
             if avg_direction[1] > 0:
                 pitch_rad = -pitch_rad
@@ -374,12 +620,17 @@ def gen_frames(stream_output=True):
 
             # Apply calibration offsets
             with calibration_lock:
+                latest_raw_yaw = raw_yaw_deg
+                latest_raw_pitch = raw_pitch_deg
                 yaw_deg += calibration_offset_yaw
                 pitch_deg += calibration_offset_pitch
 
             # Map to screen coordinates
-            screen_x = int(((yaw_deg - (180 - YAW_DEGREES)) / (2 * YAW_DEGREES)) * SCREEN_W)
-            screen_y = int(((180 + PITCH_DEGREES - pitch_deg) / (2 * PITCH_DEGREES)) * SCREEN_H)
+            scope = max(0.35, min(2.0, float(SETTINGS.get("cursor_scope", 1.0))))
+            yaw_range = YAW_DEGREES * scope
+            pitch_range = PITCH_DEGREES * scope
+            screen_x = int(((yaw_deg - (180 - yaw_range)) / (2 * yaw_range)) * SCREEN_W)
+            screen_y = int(((180 + pitch_range - pitch_deg) / (2 * pitch_range)) * SCREEN_H)
 
             # Apply axis inversion to correct camera mirroring
             # INVERT_X: flip horizontal so look LEFT = cursor LEFT
@@ -395,7 +646,8 @@ def gen_frames(stream_output=True):
 
             # Apply EMA smoothing for accessible speed
             global prev_screen_x, prev_screen_y
-            ema_alpha = 0.25  # Low alpha = slower, smoother cursor
+            speed = max(0.1, min(1.5, float(SETTINGS.get("cursor_speed", 0.5))))
+            ema_alpha = max(0.05, min(0.85, speed * 0.57))
             screen_x = int(prev_screen_x + ema_alpha * (screen_x - prev_screen_x))
             screen_y = int(prev_screen_y + ema_alpha * (screen_y - prev_screen_y))
             prev_screen_x = screen_x
@@ -414,74 +666,45 @@ def gen_frames(stream_output=True):
             cv2.line(frame, (int(avg_origin[0]), int(avg_origin[1])), 
                     (int(ray_end[0]), int(ray_end[1])), (15, 255, 0), 3)
             # --- BLINK DETECTION with FATIGUE MONITORING ---
-            ratio = get_blink_ratio(face_landmarks, LEFT_EYE)
+            left_ratio = get_blink_ratio(face_landmarks, LEFT_EYE)
+            right_ratio = get_blink_ratio(face_landmarks, RIGHT_EYE)
+            ratio = (left_ratio + right_ratio) / 2.0
             current_time = time.time()
-            
-            # Use fixed sensitivity (fatigue monitor disabled for now)
-            base_thresh = SETTINGS["blink_sensitivity"]
-            thresh = base_thresh
-            # thresh = fatigue_monitor.get_adjusted_sensitivity(base_thresh)
+            base_thresh = float(SETTINGS.get("blink_sensitivity", BLINK_THRESH))
+            thresh = fatigue_monitor.get_adjusted_sensitivity(base_thresh)
+            blink_detector.configure(
+                blinks_required=int(SETTINGS.get("blinks_to_click", BLINKS_TO_CLICK)),
+                blink_window=float(SETTINGS.get("blink_window", BLINK_WINDOW)),
+                click_cooldown=float(SETTINGS.get("lock_delay", BLINK_COOLDOWN)),
+            )
+            blink_update = blink_detector.update(ratio < thresh, current_time)
 
-            if ratio < thresh:
-                if not blink_active:
-                    # Capture cursor position at blink start (before tracking disruption)
-                    with mouse_lock:
-                        blink_cursor_pos = (mouse_target[0], mouse_target[1])
-                    blink_freeze = True  # Freeze cursor during blink
-                blink_active = True
-            else:
-                if blink_active:
-                    blink_freeze = False  # Unfreeze cursor
-                    # Blink completed - record for fatigue monitoring
-                    fatigue_monitor.record_blink()
-                    if (current_time - last_click_time) > BLINK_COOLDOWN:
-                        # Use pre-blink cursor position for accurate click targeting
-                        dispatch_blink_click(blink_cursor_pos[0], blink_cursor_pos[1])
-                        last_click_time = current_time
-                    blink_active = False
+            if blink_update.blink_started:
+                with mouse_lock:
+                    blink_cursor_pos = (mouse_target[0], mouse_target[1])
+                blink_freeze = True
 
-            #     # Register blink after minimum duration (and not already registered)
-            #     if blink_duration > BLINK_DURATION_MIN and not blink_triggered:
-            #         blink_triggered = True
-            #         blink_timestamps.append(current_time)
-                    
-            #         # Remove old blinks outside the time window
-            #         blink_timestamps = [t for t in blink_timestamps if current_time - t < BLINK_WINDOW]
-                    
-            #         # Check if we have 2 blinks within the window
-            #         if len(blink_timestamps) >= BLINKS_TO_CLICK:
-            #             if (current_time - last_click_time) > BLINK_COOLDOWN:
-            #                 try:
-            #                     pyautogui.click()
-            #                     # Play click sound (macOS)
-            #                     import subprocess
-            #                     subprocess.Popen(['afplay', '/System/Library/Sounds/Tink.aiff'], 
-            #                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            #                     last_click_time = current_time
-            #                     blink_timestamps = []  # Reset after click
-            #                 except:
-            #                     pass
+            if blink_update.blink_completed:
+                blink_freeze = False
+                fatigue_monitor.record_blink()
+                if blink_update.click_triggered and not SETTINGS.get("system_paused", False):
+                    dispatch_blink_click(blink_cursor_pos[0], blink_cursor_pos[1])
+            elif not blink_detector.is_closed:
+                blink_freeze = False
 
-            #     cv2.circle(frame, (50, 50), 20, (0, 255, 0), -1)
-            # else:
-            #     blink_start_time = 0
-            #     blink_triggered = False
-
-            # Remove expired blinks from window
-            blink_timestamps = [t for t in blink_timestamps if current_time - t < BLINK_WINDOW]
-            
-            # Show blink count feedback
-            blink_count_display = len(blink_timestamps)
-            cv2.putText(frame, f"Blinks: {blink_count_display}/2", 
+            required_blinks = blink_detector.blinks_required
+            cv2.putText(frame, f"Blinks: {blink_update.blink_count}/{required_blinks}",
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
             # Display tracking info
             cv2.putText(frame, f"Yaw: {raw_yaw_deg:.1f} Pitch: {raw_pitch_deg:.1f}", 
                        (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, "Blink 2x to click | 'c' to calibrate", 
+            cv2.putText(frame, f"Blink {required_blinks}x to click | 'c' calibrates | F12 pauses",
                        (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         else:
+            blink_detector.reset(clear_sequence=True)
+            blink_freeze = False
             cv2.putText(frame, "FACE NOT DETECTED", (50, 50), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
@@ -502,7 +725,26 @@ def tracking_loop():
         for _ in gen_frames(stream_output=False):
             pass
     except Exception as exc:
-        print(f"[Tracking] Loop stopped: {exc}")
+        if not shutdown_event.is_set():
+            logger.exception("Tracking loop stopped: %s", exc)
+
+
+def stream_preview_frames():
+    """Stream copies produced by the one tracking loop to Flask clients."""
+    while not shutdown_event.is_set():
+        frame = get_latest_preview_frame()
+        if frame is None:
+            shutdown_event.wait(0.05)
+            continue
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if ret:
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n'
+                + buffer.tobytes()
+                + b'\r\n'
+            )
+        shutdown_event.wait(0.04)
 
 
 # --- ROUTES ---
@@ -513,60 +755,97 @@ def index():
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(stream_preview_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 @app.route('/calibrate', methods=['POST'])
 def calibrate():
     """Calibrate the gaze tracking to center on current head position."""
-    global calibration_offset_yaw, calibration_offset_pitch
-    
-    # Get current raw values from the tracking loop
-    # For now, we set a flag that will be read in the next frame
-    with calibration_lock:
-        # Reset offsets - the next frame will recalibrate
-        calibration_offset_yaw = 0
-        calibration_offset_pitch = 0
-    
-    return jsonify({"status": "calibration_reset", "message": "Look at center of screen and press 'c' to calibrate"})
+    calibrated = calibrate_current_pose()
+    status = 200 if calibrated else 409
+    return jsonify({
+        "status": "calibrated" if calibrated else "not_ready",
+        "message": "Calibration complete" if calibrated else "No face pose is available yet",
+    }), status
 
 
 @app.route('/update_settings', methods=['POST'])
 def update_settings():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     if 'emergency_contact' in data:
-        SETTINGS['emergency_contact'] = data['emergency_contact']
+        SETTINGS['emergency_contact'] = str(data['emergency_contact']).strip()
     if 'cursor_scope' in data:
         try:
-            SETTINGS['cursor_scope'] = float(data['cursor_scope'])
-        except:
-            pass
+            SETTINGS['cursor_scope'] = max(0.35, min(2.0, float(data['cursor_scope'])))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid cursor_scope"}), 400
     if 'blink_sensitivity' in data:
         try:
-            SETTINGS['blink_sensitivity'] = float(data['blink_sensitivity'])
-        except:
-            pass
+            SETTINGS['blink_sensitivity'] = max(0.10, min(0.40, float(data['blink_sensitivity'])))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid blink_sensitivity"}), 400
     if 'cursor_speed' in data:
         try:
             speed = float(data['cursor_speed'])
-            SETTINGS['cursor_speed'] = max(0.3, min(1.5, speed))  # Clamp to valid range
-        except:
-            pass
+            SETTINGS['cursor_speed'] = max(0.1, min(1.5, speed))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid cursor_speed"}), 400
+    if 'blinks_to_click' in data:
+        try:
+            SETTINGS['blinks_to_click'] = max(1, min(2, int(data['blinks_to_click'])))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid blinks_to_click"}), 400
+    if 'blink_window' in data:
+        try:
+            SETTINGS['blink_window'] = max(0.5, min(3.0, float(data['blink_window'])))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid blink_window"}), 400
+    if 'lock_delay' in data:
+        try:
+            SETTINGS['lock_delay'] = max(0.2, min(5.0, float(data['lock_delay'])))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid lock_delay"}), 400
     if 'overlay_enabled' in data:
-        SETTINGS['overlay_enabled'] = bool(data['overlay_enabled'])
+        try:
+            SETTINGS['overlay_enabled'] = coerce_bool(data['overlay_enabled'])
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid overlay_enabled"}), 400
     if 'mouse_control_enabled' in data:
-        SETTINGS['mouse_control_enabled'] = bool(data['mouse_control_enabled'])
+        try:
+            SETTINGS['mouse_control_enabled'] = coerce_bool(data['mouse_control_enabled'])
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid mouse_control_enabled"}), 400
+    save_settings()
     return jsonify({"status": "updated", "settings": SETTINGS})
+
+
+@app.route('/settings')
+def get_settings():
+    return jsonify(SETTINGS)
 
 
 @app.route('/perform_action', methods=['POST'])
 def perform_action():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     action = data.get('action')
     text = data.get('text', '')
     return jsonify(perform_action_internal(action, text))
-    stats = fatigue_monitor.get_stats()
-    return jsonify(stats)
+
+
+@app.route('/fatigue_status')
+def fatigue_status():
+    return jsonify(fatigue_monitor.check_fatigue())
+
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "ok",
+        "face_detected": is_face_tracking_active(),
+        "camera_open": bool(cap and cap.isOpened()),
+        "paused": SETTINGS.get("system_paused", False),
+        "fatigue": fatigue_monitor.get_stats(),
+    })
 
 
 # --- VOICE COMMAND ROUTES ---
@@ -578,7 +857,7 @@ def voice_command():
     Expects JSON: {"text": "search hello on google"}
     Returns action status or pending confirmation request.
     """
-    data = request.json
+    data = request.get_json(silent=True) or {}
     text = data.get('text', '')
     
     if not text:
@@ -614,57 +893,120 @@ def pending_action():
 
 # --- KEYBOARD LISTENER FOR CALIBRATION ---
 def keyboard_listener():
-    """Listen for keyboard input for calibration ('c' key)."""
-    global calibration_offset_yaw, calibration_offset_pitch
+    """Listen for the caregiver calibration and emergency-pause keys."""
     
     try:
         from pynput import keyboard
         from pynput.keyboard import Key
         
         def on_press(key):
-            global calibration_offset_yaw, calibration_offset_pitch
             try:
                 if hasattr(key, 'char') and key.char == 'c':
-                    # Calibration will be handled in the next frame
-                    # We need access to raw values, so we set a flag
-                    print("[Calibration] Press detected - calibrating on next frame...")
+                    if not calibrate_current_pose():
+                        logger.warning("Calibration requested before a face pose was available")
+                elif key == Key.f12:
+                    SETTINGS["system_paused"] = not SETTINGS.get("system_paused", False)
+                    desktop_overlay.dispatch_notification(
+                        "SYSTEM PAUSED - press F12 to resume"
+                        if SETTINGS["system_paused"]
+                        else "OptiKinesis resumed"
+                    )
+                    logger.warning(
+                        "F12 safety pause: %s",
+                        "PAUSED" if SETTINGS["system_paused"] else "RESUMED",
+                    )
             except AttributeError:
                 pass
         
         listener = keyboard.Listener(on_press=on_press)
         listener.start()
-        listener.join()
+        while not shutdown_event.wait(0.2):
+            pass
+        listener.stop()
     except ImportError:
         print("WARNING: pynput not installed. Keyboard calibration disabled.")
         print("Install with: pip install pynput")
+    except Exception as exc:
+        logger.warning("Global safety-key listener stopped: %s", exc)
 
 
-if __name__ == '__main__':
-    # Configure desktop overlay callbacks and references
+def run_application(args):
+    """Start either the native overlay (default) or the optional web UI."""
+    hardware_ready = initialize_hardware()
     desktop_overlay.configure_overlay(
         settings=SETTINGS,
         action_executor=perform_action_internal,
         whatsapp_sender=auto_send_whatsapp,
         frame_provider=get_latest_preview_frame,
         voice_executor=voice_executor,
+        fatigue_provider=fatigue_monitor.check_fatigue,
+        shutdown_callback=cleanup_resources,
         lock_delay=LOCK_DELAY,
         debug_hud=DEBUG_BLINK_HUD,
     )
+    voice_executor.set_reminder_callback(desktop_overlay.dispatch_notification)
 
-    # Start mouse mover thread
-    threading.Thread(target=mouse_mover, daemon=True).start()
-    
-    # Start keyboard listener for calibration
-    threading.Thread(target=keyboard_listener, daemon=True).start()
-    
-    # PyQt5 MUST run in the main thread on macOS / Windows
-    if PYQT5_AVAILABLE:
-        # Keep gaze/blink tracking running even without opening /video_feed in a browser.
-        threading.Thread(target=tracking_loop, daemon=True).start()
-
-        # Launch the native desktop overlay
-        desktop_overlay.launch_overlay()
+    new_workers = [
+        threading.Thread(target=mouse_mover, name="mouse-mover", daemon=True),
+        threading.Thread(target=keyboard_listener, name="safety-keys", daemon=True),
+    ]
+    if hardware_ready:
+        new_workers.append(
+            threading.Thread(target=tracking_loop, name="face-tracking", daemon=True)
+        )
     else:
-        print("ERROR: PyQt5 is required for system-level overlay mode.")
-        print("Install with: pip install PyQt5")
-        sys.exit(1)
+        logger.warning("Starting UI without camera tracking")
+    worker_threads.extend(new_workers)
+    for worker in new_workers:
+        worker.start()
+
+    if args.web:
+        url = f"http://{args.host}:{args.port}"
+        if not args.no_browser:
+            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        logger.info("Starting optional web interface at %s", url)
+        try:
+            app.run(
+                host=args.host,
+                port=args.port,
+                debug=False,
+                threaded=True,
+                use_reloader=False,
+            )
+        finally:
+            cleanup_resources()
+        return
+
+    if PYQT5_AVAILABLE:
+        try:
+            # Qt must own the main thread on Windows and macOS.
+            desktop_overlay.launch_overlay()
+        finally:
+            cleanup_resources()
+    else:
+        logger.error("PyQt5 is required for native overlay mode")
+        cleanup_resources()
+        raise SystemExit(1)
+
+
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(description="OptiKinesis assistive computer control")
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="run the legacy-compatible browser dashboard instead of the native overlay",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="web-mode bind address")
+    parser.add_argument("--port", default=5000, type=int, help="web-mode port")
+    parser.add_argument(
+        "--no-browser", action="store_true", help="do not open a browser automatically in web mode"
+    )
+    return parser.parse_args(argv)
+
+
+if __name__ == '__main__':
+    try:
+        run_application(parse_arguments())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        cleanup_resources()

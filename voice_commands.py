@@ -1,5 +1,5 @@
 """
-Voice-Based Daily Task Automation for Senseway
+Voice-Based Daily Task Automation for OptiKinesis
 
 This module provides voice command processing for common daily tasks,
 reducing the need for repetitive eye-gaze and blink interactions.
@@ -23,6 +23,7 @@ import smtplib
 import webbrowser
 import urllib.parse
 import threading
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, Any, Optional, Callable, List, Tuple
@@ -145,10 +146,10 @@ class VoiceCommandParser:
         Returns:
             ParsedIntent with action type, parameters, and confidence
         """
-        text_lower = text.lower().strip()
+        text_clean = text.strip()
         
         for pattern, action_type, param_names, requires_confirm in self.PATTERNS:
-            match = re.search(pattern, text_lower, re.IGNORECASE)
+            match = re.search(pattern, text_clean, re.IGNORECASE)
             if match:
                 params = {}
                 for i, name in enumerate(param_names):
@@ -156,7 +157,7 @@ class VoiceCommandParser:
                         params[name] = match.group(i + 1).strip()
                 
                 # Calculate confidence based on match quality
-                confidence = self._calculate_confidence(match, text_lower)
+                confidence = self._calculate_confidence(match, text_clean)
                 
                 return ParsedIntent(
                     action_type=action_type,
@@ -251,6 +252,7 @@ class ReminderScheduler:
     def __init__(self):
         self.active_reminders: List[Tuple[threading.Timer, str]] = []
         self.reminder_callback: Optional[Callable[[str], None]] = None
+        self._lock = threading.Lock()
     
     def set_callback(self, callback: Callable[[str], None]) -> None:
         """Set the callback function for when reminders trigger."""
@@ -267,16 +269,27 @@ class ReminderScheduler:
         Returns:
             Confirmation message
         """
+        delay_seconds = max(0.0, float(delay_seconds))
+        timer: Optional[threading.Timer] = None
+
         def trigger():
             voice_logger.info("Reminder triggered: %s", message)
-            if self.reminder_callback:
-                self.reminder_callback(message)
+            try:
+                if self.reminder_callback:
+                    self.reminder_callback(message)
+            except Exception as exc:
+                voice_logger.error("Reminder callback failed: %s", exc)
+            finally:
+                with self._lock:
+                    self.active_reminders = [
+                        item for item in self.active_reminders if item[0] is not timer
+                    ]
         
         timer = threading.Timer(delay_seconds, trigger)
         timer.daemon = True
+        with self._lock:
+            self.active_reminders.append((timer, message))
         timer.start()
-        
-        self.active_reminders.append((timer, message))
         
         # Format human-readable time
         if delay_seconds >= 3600:
@@ -288,12 +301,46 @@ class ReminderScheduler:
         
         voice_logger.info("Reminder scheduled in %s: %s", time_str, message)
         return f"Reminder set for {time_str}"
+
+    def schedule_alarm(self, time_text: str, message: str = "Alarm") -> str:
+        """Schedule the next occurrence of a simple spoken clock time."""
+        target = self._parse_alarm_time(time_text)
+        delay = max(0.0, (target - datetime.now()).total_seconds())
+        self.schedule_reminder(delay, message)
+        return f"Alarm set for {target.strftime('%I:%M %p').lstrip('0')}"
+
+    @staticmethod
+    def _parse_alarm_time(time_text: str) -> datetime:
+        cleaned = re.sub(r"\s+", " ", time_text.strip().lower().replace(".", ""))
+        cleaned = re.sub(r"(?<=\d)(am|pm)$", r" \1", cleaned)
+        formats = ("%I:%M %p", "%I %p", "%H:%M", "%H")
+        parsed = None
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(cleaned, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise ValueError("Use an alarm time such as '7 AM', '7:30 PM', or '19:30'.")
+
+        now = datetime.now()
+        target = now.replace(
+            hour=parsed.hour,
+            minute=parsed.minute,
+            second=0,
+            microsecond=0,
+        )
+        if target <= now:
+            target += timedelta(days=1)
+        return target
     
     def cancel_all(self) -> None:
         """Cancel all pending reminders."""
-        for timer, _ in self.active_reminders:
-            timer.cancel()
-        self.active_reminders.clear()
+        with self._lock:
+            for timer, _ in self.active_reminders:
+                timer.cancel()
+            self.active_reminders.clear()
         voice_logger.info("All reminders cancelled")
 
 
@@ -476,13 +523,9 @@ class VoiceCommandExecutor:
                 return {'status': 'success', 'message': message}
             
             elif intent.action_type == ActionType.SET_ALARM:
-                # For now, treat alarm same as reminder with parsed time
-                # Full alarm implementation would require time parsing
                 time_str = params.get('time', '')
-                return {
-                    'status': 'info', 
-                    'message': f'Alarm for {time_str} noted. (Full alarm scheduling coming soon)'
-                }
+                message = self.reminder_scheduler.schedule_alarm(time_str)
+                return {'status': 'success', 'message': message}
             
             return {'status': 'error', 'message': 'Unknown action type'}
             

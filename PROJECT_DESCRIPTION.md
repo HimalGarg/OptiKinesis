@@ -128,7 +128,7 @@ All interaction happens through a **floating desktop overlay** built with PyQt5 
 | **Camera** | 📷 | Live preview of the webcam feed so the user or caregiver can verify face tracking is working correctly. A **mini camera feed** also stays visible at all times in the bottom-right corner of the screen. |
 | **Emergency** | 🚨 | One-tap SOS actions: send a WhatsApp message to a saved emergency contact, trigger an automated phone call via Twilio, or direct-dial emergency services (100 for police, 112 for ambulance in India). |
 | **Control** | ⚙ | Adjustable settings for cursor speed, blink sensitivity, and lock delay. Caregivers can tune the system to match each individual user's motor ability. Includes calibration, mouse lock/unlock, and overlay toggle. |
-| **Voice** | 🎤 | Activate voice recognition to speak commands instead of typing and clicking. |
+| **Voice** | 🎤 | Native mode accepts command text and confirmation; optional `--web` mode uses browser-provided speech recognition. |
 
 ### Control Bar States
 
@@ -310,10 +310,11 @@ python main.py
 
 The system launches a floating overlay on your desktop:
 1. **Move your head** to control the cursor
-2. **Blink** to click
+2. **Blink deliberately** to click (two blinks by default; configurable to one)
 3. **Hover over the control bar** at the top to access Keyboard, Camera, Emergency, Control, and Voice modules
 4. **Look at a text field and blink** — the keyboard opens automatically
 5. **Blink on keyboard keys** — characters appear directly in the active text field
+6. Press **C** to calibrate center and **F12** to pause/resume safely
 
 ---
 

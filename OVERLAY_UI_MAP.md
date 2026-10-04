@@ -2,6 +2,13 @@
 
 > **Quick reference**: Which line in the code changes what on screen.
 > Use with `preview_overlay.py` for live-reload testing.
+>
+> **Maintenance note (September 2026):** the class and method names in this
+> document remain the authoritative navigation points, but the historical line
+> numbers below move as the UI evolves. Search for the named symbol rather than
+> relying on a numeric line. The current overlay also includes
+> `NotificationToastOverlay`, configurable single/double-blink mode, cursor
+> scope, post-click lock delay, and Calibrate/Pause/Exit safety controls.
 
 ---
 
@@ -127,8 +134,8 @@ All visual styling for the floating bar is in one stylesheet block:
 ### Window Size (Lines 307–315)
 
 ```python
-width=min(1420, int(SCREEN_W * 0.82))   # Panel width
-height=min(540, int(SCREEN_H * 0.58))   # Panel height
+width=min(1400, int(SCREEN_W * 0.85))   # Panel width
+height=min(340, int(SCREEN_H * 0.44))   # Panel height
 self.header.hide()  # Line 315 — title bar hidden for compact look
 ```
 
@@ -136,30 +143,22 @@ self.header.hide()  # Line 315 — title bar hidden for compact look
 
 | What to change | Where |
 |---|---|
-| **Gap between keyboard and action buttons** | Line 324: `wrapper.setSpacing(8)` |
-| **Gap between key rows** | Line 342: `keyboard_rows.setSpacing(4)` |
-| **Keyboard vs action column ratio** | Lines 329 / 333: `wrapper.addLayout(left, 6)` and `wrapper.addLayout(right, 1)` — change the numbers to rebalance |
+| **Gap between keyboard and action buttons** | `wrapper.setSpacing(0)` |
+| **Gap between key rows** | `keyboard_rows.setSpacing(0)` |
+| **Keyboard vs action column ratio** | `wrapper.addLayout(left, 5)` and `wrapper.addLayout(right, 1)` — change the numbers to rebalance |
 
 ### Text Input Area (Lines 335–339)
 
 | What to change | Where |
 |---|---|
-| **Text area height** | Line 337: `setFixedHeight(68)` |
+| **Text area height** | `setFixedHeight(54)`; the widget is hidden and retained as the action-button text buffer |
 | **Placeholder text** | Line 338: `"> TYPE WITH GAZE + BLINK"` |
 
 ### Key Sizes (Lines 395–401)
 
-```python
-width_map = {
-    "sm": 58,       # Small keys (Win, Alt, arrows)
-    "default": 64,  # Regular letter keys
-    "lg": 96,       # Medium keys (Tab, Ctrl, CLR)
-    "xl": 120,      # Large keys (Caps, Shift, Enter, Backspace)
-    "space": 300,   # Spacebar
-}
-```
-
-**Key height**: Line 520 inside `_build_key_button()` → `btn.setFixedHeight(42)`
+Keys use expanding size policies and per-key stretch factors in each
+`build_row()` specification. Change the `stretch` value to make a key wider;
+row and panel height determine key height.
 
 ### Keyboard Stylesheet (Lines 345–393)
 

@@ -41,7 +41,7 @@ def run_overlay():
         whatsapp_sender=lambda num, msg: print(f"[Preview] WhatsApp → {num}: {msg}"),
         frame_provider=lambda: None,   # No camera feed
         voice_executor=None,
-        lock_delay=1.5,
+        lock_delay=0.5,
         debug_hud=False,
     )
 

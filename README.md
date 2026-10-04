@@ -127,7 +127,7 @@ All interaction happens through a floating desktop overlay (PyQt5) that sits on 
 | **📷 Camera** | Live preview of the webcam feed so the user or caregiver can verify face tracking. A mini camera feed also stays visible in the bottom-right corner at all times. |
 | **🚨 Emergency** | One-tap SOS actions: WhatsApp message to a saved emergency contact, automated phone call via Twilio, or direct dial to emergency services (100 police / 112 ambulance in India). |
 | **⚙ Control** | Adjustable settings for cursor speed, blink sensitivity, and lock delay — so caregivers can tune the system to each user's ability. |
-| **🎤 Voice** | Activate voice recognition to speak commands instead of typing and clicking. |
+| **🎤 Voice** | Native mode accepts command text with confirmation dialogs. Optional web mode adds browser-provided speech recognition. |
 
 ---
 
@@ -319,6 +319,7 @@ A working professional (40–60 years) experiencing progressive upper-limb motor
 ```
 OptiKinesis/
 ├── main.py                  # Entry point — camera loop, tracking, blink detection, Flask API
+├── blink_detector.py        # Deliberate single/double-blink state machine
 ├── desktop_overlay.py       # PyQt5 overlay UI — all panels, keyboard, control bar, gaze bridge
 ├── voice_commands.py         # Voice command NLP parsing and task automation
 ├── fatigue_monitor.py        # Rolling-window blink-rate analyzer for fatigue detection
@@ -330,7 +331,7 @@ OptiKinesis/
 ├── PROJECT_DESCRIPTION.md    # Detailed project description document
 ├── templates/                # Flask HTML templates (web dashboard)
 ├── static/                   # Static assets for web interface
-└── overlay/                  # Modular overlay package (in development)
+└── tests/                    # Automated blink, fatigue, voice, and API tests
 ```
 
 ---
@@ -353,7 +354,23 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The system will launch a floating overlay on your desktop. Move your head to control the cursor. Blink to click. Use the control bar to access the keyboard, camera, emergency, and settings modules.
+The system launches the native floating overlay. Move your head to control the cursor and use deliberate blinks to click. The default is two blinks within 1.5 seconds. Press **C** while looking at screen center to calibrate, and press **F12** at any time to pause or resume mouse control.
+
+Optional browser dashboard:
+
+```bash
+python main.py --web
+```
+
+The web server binds to `127.0.0.1` by default. Use `python main.py --help` for host, port, and browser-launch options.
+
+Optional Twilio and SMTP integrations can be configured by copying `.env.example` to `.env` and filling only the credentials you need. User accessibility settings are saved locally in `settings.json`.
+
+### Tests
+
+```bash
+python -m unittest discover -v
+```
 
 ---
 
