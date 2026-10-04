@@ -21,7 +21,10 @@ import cv2
 import pyautogui
 import ctypes
 import logging
-from ctypes import wintypes
+try:
+    from ctypes import wintypes
+except ImportError:
+    wintypes = None
 
 logger = logging.getLogger("optikinesis.overlay")
 
