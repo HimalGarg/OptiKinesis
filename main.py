@@ -671,7 +671,9 @@ def gen_frames(stream_output=True):
             ratio = (left_ratio + right_ratio) / 2.0
             current_time = time.time()
             base_thresh = float(SETTINGS.get("blink_sensitivity", BLINK_THRESH))
-            thresh = fatigue_monitor.get_adjusted_sensitivity(base_thresh)
+            # Fatigue monitoring deactivated for now
+            # thresh = fatigue_monitor.get_adjusted_sensitivity(base_thresh)
+            thresh = base_thresh
             blink_detector.configure(
                 blinks_required=int(SETTINGS.get("blinks_to_click", BLINKS_TO_CLICK)),
                 blink_window=float(SETTINGS.get("blink_window", BLINK_WINDOW)),
