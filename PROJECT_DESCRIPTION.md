@@ -82,7 +82,7 @@ This vector is decomposed into:
 - **Yaw** (horizontal angle) → mapped to screen X coordinate
 - **Pitch** (vertical angle) → mapped to screen Y coordinate
 
-**Sensitivity tuning:** A head turn of only ±25° covers the entire screen width. This means users with severely limited neck mobility can still reach every corner of their display.
+**Personal calibration:** A short 5-point calibration (center plus four corners) records how far each user can comfortably turn in every direction. The cursor map is fitted to that range, including uneven reach to one side, so users with severely limited neck mobility can still reach every corner of their display. Points are captured automatically when the head is steady, so calibrating needs no blinks. Before calibration, a default head turn of ±25° covers the screen width.
 
 **Smoothing:** A 12-frame rolling average combined with Exponential Moving Average (EMA) filtering eliminates the natural jitter of webcam tracking, producing cursor movement that feels deliberate and controlled rather than shaky.
 
@@ -167,6 +167,7 @@ Mouse Mover Thread                   Gaze Click Bridge
 | File | Purpose |
 |---|---|
 | `main.py` | Entry point. Camera capture loop, MediaPipe face tracking, head-pose computation, blink detection, mouse control thread, Flask API server, and PyQt5 overlay launch. |
+| `head_calibration.py` | 5-point head calibration: steady-pose capture, validation, and the per-user map from head angles to screen position. |
 | `desktop_overlay.py` | All PyQt5 overlay UI code: `CursorOverlay` (gaze ring), `FloatingControlBar`, `KeyboardOverlayPanel`, `CameraOverlayPanel`, `EmergencyOverlayPanel`, `ControlOverlayPanel`, `MiniCameraOverlay`, `GazeClickBridge`, and `BlinkDebugOverlay`. |
 | `voice_commands.py` | Voice command NLP engine: intent parsing via regex patterns, action execution (Google search, YouTube, email, alarm, reminder), confirmation workflow, and logging. |
 | `fatigue_monitor.py` | Rolling-window blink-rate analyzer that detects excessive blinking (fatigue) and can reduce sensitivity to prevent accidental clicks. |
@@ -314,7 +315,8 @@ The system launches a floating overlay on your desktop:
 3. **Hover over the control bar** at the top to access Keyboard, Camera, Emergency, Control, and Voice modules
 4. **Look at a text field and blink** — the keyboard opens automatically
 5. **Blink on keyboard keys** — characters appear directly in the active text field
-6. Press **C** to calibrate center and **F12** to pause/resume safely
+6. On first launch, follow the 5-point calibration: turn comfortably toward each dot and hold still
+7. Press **F9** to re-center after shifting position, and **F12** to pause/resume safely
 
 ---
 

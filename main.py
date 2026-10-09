@@ -20,6 +20,7 @@ from logging.handlers import RotatingFileHandler
 from collections import deque
 
 from blink_detector import DeliberateBlinkDetector
+from head_calibration import HeadCalibration
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -124,6 +125,8 @@ DEFAULT_SETTINGS = {
     "overlay_enabled": True,
     "mouse_control_enabled": True,
     "system_paused": False,
+    # Saved 5-point head calibration (see head_calibration.py), or None.
+    "head_calibration": None,
 }
 
 
@@ -167,6 +170,13 @@ def save_settings():
 
 SETTINGS = load_settings()
 
+# Personal head-angle -> screen map from the 5-point calibration.  When it is
+# None the cursor falls back to fixed ranges around a center offset.
+head_calibration_model = HeadCalibration.from_dict(SETTINGS.get("head_calibration"))
+if SETTINGS.get("head_calibration") and head_calibration_model is None:
+    logger.warning("Saved head calibration was unusable and has been ignored")
+    SETTINGS["head_calibration"] = None
+
 
 def coerce_bool(value):
     if isinstance(value, bool):
@@ -190,7 +200,11 @@ calibration_offset_yaw = 0
 calibration_offset_pitch = 0
 latest_raw_yaw = None
 latest_raw_pitch = None
+latest_pose_time = 0.0
 calibration_lock = threading.Lock()
+# Set while the 5-point calibration screen runs: cursor movement and blink
+# clicks are suspended so the user can look around freely.
+calibration_active = threading.Event()
 
 # Ray smoothing buffers
 ray_origins = deque(maxlen=FILTER_LENGTH)
@@ -256,26 +270,121 @@ def is_face_tracking_active():
         return time.time() - last_face_seen <= FACE_LOSS_TIMEOUT
 
 
+def get_tracking_status():
+    """Summarise tracker state for the overlay status pill."""
+    if SETTINGS.get("system_paused", False):
+        return "paused"
+    if cap is None:
+        return "no_camera"
+    if not SETTINGS.get("mouse_control_enabled", True):
+        return "mouse_off"
+    return "tracking" if is_face_tracking_active() else "no_face"
+
+
 def mark_face_seen():
     global last_face_seen
     with tracking_state_lock:
         last_face_seen = time.time()
 
 
+def get_latest_raw_pose():
+    """Latest smoothed head angles as (yaw, pitch, timestamp), or None without a face."""
+    with calibration_lock:
+        if latest_raw_yaw is None or latest_raw_pitch is None:
+            return None
+        if time.time() - latest_pose_time > FACE_LOSS_TIMEOUT:
+            return None
+        return latest_raw_yaw, latest_raw_pitch, latest_pose_time
+
+
 def calibrate_current_pose():
-    """Map the most recently observed neutral head pose to screen center."""
-    global calibration_offset_yaw, calibration_offset_pitch
+    """Re-center: map the most recently observed head pose to screen center.
+
+    With a 5-point calibration this shifts the whole personal map and keeps
+    the reach it learned; without one it sets the simple center offsets.
+    """
+    global calibration_offset_yaw, calibration_offset_pitch, head_calibration_model
     with calibration_lock:
         if latest_raw_yaw is None or latest_raw_pitch is None:
             return False
-        calibration_offset_yaw = 180.0 - latest_raw_yaw
-        calibration_offset_pitch = 180.0 - latest_raw_pitch
-    logger.info(
-        "Calibrated center: yaw offset %.2f, pitch offset %.2f",
-        calibration_offset_yaw,
-        calibration_offset_pitch,
-    )
+        if head_calibration_model is not None:
+            head_calibration_model = head_calibration_model.recentered(
+                latest_raw_yaw, latest_raw_pitch
+            )
+            SETTINGS["head_calibration"] = head_calibration_model.to_dict()
+            recentered_model = True
+        else:
+            calibration_offset_yaw = 180.0 - latest_raw_yaw
+            calibration_offset_pitch = 180.0 - latest_raw_pitch
+            recentered_model = False
+    if recentered_model:
+        save_settings()
+        logger.info("Re-centered the 5-point head calibration")
+    else:
+        logger.info(
+            "Calibrated center: yaw offset %.2f, pitch offset %.2f",
+            calibration_offset_yaw,
+            calibration_offset_pitch,
+        )
     return True
+
+
+def begin_head_calibration():
+    """Suspend cursor movement and blink clicks while the calibration screen runs."""
+    calibration_active.set()
+    logger.info("5-point head calibration started")
+
+
+def finish_head_calibration(model):
+    """Apply and save a finished calibration, or just resume when model is None.
+
+    Returns True only when a new calibration was applied and saved.
+    """
+    global head_calibration_model
+    try:
+        if model is None:
+            logger.info("5-point head calibration ended without changes")
+            return False
+        with calibration_lock:
+            head_calibration_model = model
+            SETTINGS["head_calibration"] = model.to_dict()
+        saved = save_settings()
+        logger.info("5-point head calibration applied%s", "" if saved else " (not saved)")
+        return saved
+    finally:
+        calibration_active.clear()
+
+
+def needs_head_calibration():
+    """True when the camera works but no 5-point calibration exists yet."""
+    return head_calibration_model is None and cap is not None
+
+
+def map_pose_to_screen(raw_yaw, raw_pitch):
+    """Convert raw head angles to an (unclamped) screen position in pixels."""
+    with calibration_lock:
+        model = head_calibration_model
+        offset_yaw = calibration_offset_yaw
+        offset_pitch = calibration_offset_pitch
+    if model is not None:
+        nx, ny = model.map(raw_yaw, raw_pitch)
+        return nx * SCREEN_W, ny * SCREEN_H
+
+    # Fallback before a 5-point calibration exists: fixed angle ranges,
+    # scaled by cursor_scope, around the center offset.
+    yaw_deg = raw_yaw + offset_yaw
+    pitch_deg = raw_pitch + offset_pitch
+    scope = max(0.35, min(2.0, float(SETTINGS.get("cursor_scope", 1.0))))
+    yaw_range = YAW_DEGREES * scope
+    pitch_range = PITCH_DEGREES * scope
+    screen_x = ((yaw_deg - (180 - yaw_range)) / (2 * yaw_range)) * SCREEN_W
+    screen_y = ((180 + pitch_range - pitch_deg) / (2 * pitch_range)) * SCREEN_H
+    # Correct camera mirroring: look left -> cursor left.
+    if INVERT_X:
+        screen_x = SCREEN_W - screen_x
+    if INVERT_Y:
+        screen_y = SCREEN_H - screen_y
+    return screen_x, screen_y
 
 
 # --- MOUSE MOVER THREAD ---
@@ -285,13 +394,17 @@ def mouse_mover():
         if (
             SETTINGS.get("mouse_control_enabled", True)
             and not SETTINGS.get("system_paused", False)
+            and not calibration_active.is_set()
             and is_face_tracking_active()
         ):
             with mouse_lock:
                 x, y = mouse_target
             try:
                 if not (math.isnan(x) or math.isnan(y)):
-                    pyautogui.moveTo(x, y)
+                    # PyAutoGUI sleeps 0.1 s after every call by default, which
+                    # capped cursor updates at ~9 per second.  Skip that pause
+                    # here only; the corner failsafe is still checked first.
+                    pyautogui.moveTo(x, y, _pause=False)
             except pyautogui.FailSafeException:
                 SETTINGS["system_paused"] = True
                 logger.warning("PyAutoGUI failsafe activated; system paused")
@@ -405,7 +518,7 @@ def perform_action_internal(action, text=""):
         calibrated = calibrate_current_pose()
         return {
             "status": "calibrated" if calibrated else "error",
-            "message": "Calibration complete" if calibrated else "No face pose is available yet",
+            "message": "Cursor re-centered" if calibrated else "No face pose is available yet",
         }
     elif action == 'save_settings':
         return {"status": "saved" if save_settings() else "error"}
@@ -502,8 +615,8 @@ atexit.register(cleanup_resources)
 
 def gen_frames(stream_output=True):
     """Generate video frames with head-pose tracking (from MonitorTracking.py)."""
-    global calibration_offset_yaw, calibration_offset_pitch, latest_preview_frame
-    global latest_raw_yaw, latest_raw_pitch
+    global latest_preview_frame
+    global latest_raw_yaw, latest_raw_pitch, latest_pose_time
 
     if cap is None or face_landmarker is None:
         logger.error("Tracking requested before hardware initialization")
@@ -618,31 +731,20 @@ def gen_frames(stream_output=True):
             raw_yaw_deg = yaw_deg
             raw_pitch_deg = pitch_deg
 
-            # Apply calibration offsets
+            # Publish the pose for re-centering and the calibration screen
             with calibration_lock:
                 latest_raw_yaw = raw_yaw_deg
                 latest_raw_pitch = raw_pitch_deg
-                yaw_deg += calibration_offset_yaw
-                pitch_deg += calibration_offset_pitch
+                latest_pose_time = time.time()
 
-            # Map to screen coordinates
-            scope = max(0.35, min(2.0, float(SETTINGS.get("cursor_scope", 1.0))))
-            yaw_range = YAW_DEGREES * scope
-            pitch_range = PITCH_DEGREES * scope
-            screen_x = int(((yaw_deg - (180 - yaw_range)) / (2 * yaw_range)) * SCREEN_W)
-            screen_y = int(((180 + pitch_range - pitch_deg) / (2 * pitch_range)) * SCREEN_H)
-
-            # Apply axis inversion to correct camera mirroring
-            # INVERT_X: flip horizontal so look LEFT = cursor LEFT
-            # INVERT_Y: flip vertical so look UP = cursor UP
-            if INVERT_X:
-                screen_x = SCREEN_W - screen_x
-            if INVERT_Y:
-                screen_y = SCREEN_H - screen_y
+            # Map to screen coordinates (personal 5-point map when available)
+            screen_x, screen_y = map_pose_to_screen(raw_yaw_deg, raw_pitch_deg)
+            if not (math.isfinite(screen_x) and math.isfinite(screen_y)):
+                continue
 
             # Clamp to screen bounds
-            screen_x = max(10, min(SCREEN_W - 10, screen_x))
-            screen_y = max(10, min(SCREEN_H - 10, screen_y))
+            screen_x = int(max(10, min(SCREEN_W - 10, screen_x)))
+            screen_y = int(max(10, min(SCREEN_H - 10, screen_y)))
 
             # Apply EMA smoothing for accessible speed
             global prev_screen_x, prev_screen_y
@@ -689,7 +791,11 @@ def gen_frames(stream_output=True):
             if blink_update.blink_completed:
                 blink_freeze = False
                 fatigue_monitor.record_blink()
-                if blink_update.click_triggered and not SETTINGS.get("system_paused", False):
+                if (
+                    blink_update.click_triggered
+                    and not SETTINGS.get("system_paused", False)
+                    and not calibration_active.is_set()
+                ):
                     dispatch_blink_click(blink_cursor_pos[0], blink_cursor_pos[1])
             elif not blink_detector.is_closed:
                 blink_freeze = False
@@ -701,7 +807,7 @@ def gen_frames(stream_output=True):
             # Display tracking info
             cv2.putText(frame, f"Yaw: {raw_yaw_deg:.1f} Pitch: {raw_pitch_deg:.1f}", 
                        (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, f"Blink {required_blinks}x to click | 'c' calibrates | F12 pauses",
+            cv2.putText(frame, f"Blink {required_blinks}x to click | F9 re-centers | F12 pauses",
                        (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         else:
@@ -762,12 +868,12 @@ def video_feed():
 
 @app.route('/calibrate', methods=['POST'])
 def calibrate():
-    """Calibrate the gaze tracking to center on current head position."""
+    """Re-center the cursor on the current head position."""
     calibrated = calibrate_current_pose()
     status = 200 if calibrated else 409
     return jsonify({
         "status": "calibrated" if calibrated else "not_ready",
-        "message": "Calibration complete" if calibrated else "No face pose is available yet",
+        "message": "Cursor re-centered" if calibrated else "No face pose is available yet",
     }), status
 
 
@@ -895,17 +1001,27 @@ def pending_action():
 
 # --- KEYBOARD LISTENER FOR CALIBRATION ---
 def keyboard_listener():
-    """Listen for the caregiver calibration and emergency-pause keys."""
+    """Listen for caregiver keys: F9 re-centers, F12 pauses, Esc/F12 cancel calibration."""
     
     try:
         from pynput import keyboard
         from pynput.keyboard import Key
         
-        def on_press(key):
+        def on_press(key, injected=False):
+            # Keystrokes typed by the on-screen keyboard are injected.  They
+            # must never trigger caregiver shortcuts.
+            if injected:
+                return
             try:
-                if hasattr(key, 'char') and key.char == 'c':
-                    if not calibrate_current_pose():
-                        logger.warning("Calibration requested before a face pose was available")
+                if calibration_active.is_set():
+                    if key in (Key.esc, Key.f12):
+                        desktop_overlay.cancel_calibration()
+                    return
+                if key == Key.f9:
+                    if calibrate_current_pose():
+                        desktop_overlay.dispatch_notification("Cursor re-centered")
+                    else:
+                        logger.warning("Re-center requested before a face pose was available")
                 elif key == Key.f12:
                     SETTINGS["system_paused"] = not SETTINGS.get("system_paused", False)
                     desktop_overlay.dispatch_notification(
@@ -945,6 +1061,11 @@ def run_application(args):
         shutdown_callback=cleanup_resources,
         lock_delay=LOCK_DELAY,
         debug_hud=DEBUG_BLINK_HUD,
+        status_provider=get_tracking_status,
+        pose_provider=get_latest_raw_pose,
+        calibration_start=begin_head_calibration,
+        calibration_finish=finish_head_calibration,
+        calibration_needed=needs_head_calibration,
     )
     voice_executor.set_reminder_callback(desktop_overlay.dispatch_notification)
 

@@ -98,7 +98,9 @@ The system follows a three-stage pipeline:
 The user moves their head to control the mouse cursor.
 
 - **How it works:** OptiKinesis uses MediaPipe's Face Landmarker to track 478 facial points in real-time. From five key anchor points (edges of face, forehead, chin, nose), the system computes a 3D gaze ray — a direction vector that maps to screen coordinates via yaw/pitch angle decomposition.
-- **Sensitivity:** A head turn of just ±25° covers the entire screen width. Users with limited neck mobility can still reach every corner of their display.
+- **Personal 5-point calibration:** On first launch the user turns comfortably toward five dots: the center, then each corner. Each point is captured automatically once the head is steady, with no blinking needed. The cursor map is then fitted to that user's own range of movement, including uneven reach to one side. Even small head movements can therefore cover the whole screen.
+- **Re-centering:** After shifting position, press **F9** or use **Re-center** in Settings. This moves the calibrated map without redoing all five points. The full calibration can be rerun any time from Settings.
+- **Before calibration:** A default head turn of ±25° covers the screen width.
 - **Smoothness:** A 12-frame rolling average combined with Exponential Moving Average (EMA) filtering eliminates jitter, producing cursor movement that feels natural and controlled.
 
 ### Layer 2: Blink-to-Click
@@ -320,6 +322,7 @@ A working professional (40–60 years) experiencing progressive upper-limb motor
 OptiKinesis/
 ├── main.py                  # Entry point — camera loop, tracking, blink detection, Flask API
 ├── blink_detector.py        # Deliberate single/double-blink state machine
+├── head_calibration.py      # 5-point head calibration: capture logic and personal cursor map
 ├── desktop_overlay.py       # PyQt5 overlay UI — all panels, keyboard, control bar, gaze bridge
 ├── voice_commands.py         # Voice command NLP parsing and task automation
 ├── fatigue_monitor.py        # Rolling-window blink-rate analyzer for fatigue detection
@@ -331,7 +334,7 @@ OptiKinesis/
 ├── PROJECT_DESCRIPTION.md    # Detailed project description document
 ├── templates/                # Flask HTML templates (web dashboard)
 ├── static/                   # Static assets for web interface
-└── tests/                    # Automated blink, fatigue, voice, and API tests
+└── tests/                    # Automated blink, calibration, fatigue, voice, and API tests
 ```
 
 ---
@@ -354,7 +357,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The system launches the native floating overlay. Move your head to control the cursor and use deliberate blinks to click. The default is two blinks within 1.5 seconds. Press **C** while looking at screen center to calibrate, and press **F12** at any time to pause or resume mouse control.
+The system launches the native floating overlay. On first launch, a 5-point head calibration starts as soon as your face is detected: turn comfortably toward each dot and hold still. Move your head to control the cursor and use deliberate blinks to click. The default is two blinks within 1.5 seconds.
+
+Caregiver keys:
+
+| Key | Action |
+|---|---|
+| **F9** | Re-center the cursor on the current head position |
+| **F12** | Pause or resume mouse control |
+| **Esc** / **F12** | Cancel a running calibration |
+
+Keystrokes typed through the on-screen keyboard never trigger these keys.
 
 Optional browser dashboard:
 

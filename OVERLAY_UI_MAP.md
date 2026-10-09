@@ -9,6 +9,8 @@
 > relying on a numeric line. The current overlay also includes
 > `NotificationToastOverlay`, configurable single/double-blink mode, cursor
 > scope, post-click lock delay, and Calibrate/Pause/Exit safety controls.
+> The full-screen 5-point calibration lives in `HeadCalibrationOverlay`; its
+> capture logic and math are in `head_calibration.py`.
 
 ---
 
@@ -21,10 +23,10 @@ These control the **positioning of everything** on screen.
 | `TOP_MARGIN` | 34 | Gap (px) between top of screen and the floating bar |
 | `BAR_IDLE_HEIGHT` | 35 | Height of the **idle** "OVERLAY" rectangle |
 | `BAR_EXPANDED_HEIGHT` | 36 | Height of the **expanded** bar (with buttons) |
-| `PANEL_TOP_OFFSET` | 38 | Y-position where all panels (keyboard, SOS, etc.) appear — automatically calculated from `TOP_MARGIN + BAR_EXPANDED_HEIGHT + 14` |
+| `PANEL_TOP_OFFSET` | 38 | Y-position where all panels (keyboard, SOS, etc.) appear — automatically calculated from `TOP_MARGIN + BAR_EXPANDED_HEIGHT + 20` |
 
 > [!TIP]
-> If your panels overlap the bar, increase the `+ 14` gap in `PANEL_TOP_OFFSET`.
+> If your panels overlap the bar, increase the `+ 20` gap in `PANEL_TOP_OFFSET`.
 
 ---
 
@@ -42,90 +44,86 @@ The green circle that follows the mouse/gaze cursor.
 
 ---
 
-## 🔲 Floating Control Bar — `FloatingControlBar` (Lines 831–1097)
+## 🔲 Floating Control Pill — `FloatingControlBar` + `PillButton`
 
-The main top-center bar with two states: **idle** and **expanded**.
+The top-center pill. Collapsed, it shows the brand and the live tracking
+state. When the cursor rests on it, it grows smoothly into a toolbar, then
+folds back after the cursor leaves unless a panel or the voice prompt is open.
 
-### Bar Dimensions (Lines 839–843)
+Everything is custom painted with antialiasing; there is no stylesheet. The
+window keeps one fixed size and only the painted pill animates inside it, so
+the bar never jumps. A window mask keeps the unused transparent area
+click-through, and `accepts_gaze_point()` lets blink clicks there fall through
+to the app underneath.
+
+### Dimensions and timing (class constants on `FloatingControlBar`)
 
 ```python
-IDLE_W = 280          # Width of idle "OVERLAY" rectangle
-IDLE_H = BAR_IDLE_HEIGHT   # Height (uses global constant, currently 58)
-EXPANDED_W = 780      # Width of expanded button bar
-EXPANDED_H = BAR_EXPANDED_HEIGHT  # Height (uses global constant, currently 100)
-COLLAPSE_DELAY_MS = 1500   # How long (ms) before bar auto-collapses after cursor leaves
+IDLE_W = 196                      # Collapsed pill width
+IDLE_H = BAR_IDLE_HEIGHT          # Collapsed height (global constant, currently 52)
+EXPANDED_H = BAR_EXPANDED_HEIGHT  # Expanded height (global constant, currently 84)
+BRAND_W = 168                     # Space for the status dot, name and status line
+EXPANDED_W                        # Computed from BRAND_W, button size and gaps
+EXPAND_MS = 280                   # Expand animation length
+COLLAPSE_MS = 220                 # Collapse animation length
+COLLAPSE_DELAY_MS = 1200          # Wait after the cursor leaves before folding
+HOVER_SLOP = 10                   # Extra px around the expanded pill that still counts as "on it"
 ```
 
-### Idle State — "OVERLAY" Rectangle (Lines 869–883)
-
-This is the small pill shown when nothing is hovered.
+### Status line
 
 | What to change | Where |
 |---|---|
-| **"OVERLAY" text** | Line 879: `QtWidgets.QLabel("OVERLAY")` |
-| **Green dot** | Line 875: `QtWidgets.QLabel("●")` |
-| **Inner padding** | Line 872: `setContentsMargins(16, 0, 16, 0)` |
+| **State labels and dot colours** | `PILL_STATUS_STYLES` (tracking, no face, paused, mouse off, no camera) |
+| **Where the state comes from** | `get_tracking_status()` in `main.py`, passed as `status_provider` |
+| **Temporary messages** (voice results) | `show_status_message(text)`; shown for `MESSAGE_MS` |
+| **Brand name, fonts** | `_paint_brand()` and the fonts set in `__init__` |
 
-**Idle text styling** (Lines 945–956 inside stylesheet):
-```css
-QLabel#idleDot    → green dot color, font-size, font-weight
-QLabel#idleLabel  → "OVERLAY" text color, font-size, font-weight, letter-spacing
-```
-
-### Expanded State — Button Bar (Lines 885–929)
-
-Shown when the cursor hovers over the idle bar.
+### Buttons
 
 | What to change | Where |
 |---|---|
-| **Brand text** | Line 892: `"●  OPTIKINESIS"` |
-| **Inner padding** | Line 888: `setContentsMargins(18, 8, 18, 8)` |
-| **Button spacing** | Line 889: `setSpacing(10)` |
-| **Separator line** | Lines 897–901 |
+| **Add / remove / rename buttons** | `BUTTON_SPECS` — `(panel key, icon name, label, is_danger)` |
+| **Icons** | `_draw_pill_icon()` — 24-unit line icons: mic, keyboard, camera, alert, sliders |
+| **Button size, corner radius** | `PillButton.WIDTH`, `HEIGHT`, `RADIUS` |
+| **Hover / open-panel / click-flash look** | `PillButton.paintEvent()` |
 
-### Action Buttons (Lines 903–920)
+Button states: pointing at a button shows an accent ring; an open panel shows
+a tinted fill with a small bar under the label; every press flashes briefly
+so the user can see a blink registered.
 
-The 5 clickable buttons in the expanded bar.
+### Colours
 
-| What to change | Where |
-|---|---|
-| **Button labels** | Lines 905–909: `("🎤", "Voice", ...)` — first arg = icon, second = label |
-| **Button size** | Line 916: `btn.setFixedSize(110, 64)` — width × height in px |
-| **Add/remove buttons** | Edit the `buttons_spec` list (Lines 904–910) |
-| **SOS flag** | 4th element in tuple — `True` gives it the red SOS styling |
+`PILL_TEXT`, `PILL_TEXT_MUTED`, `PILL_ICON`, `PILL_ACCENT` (cyan) and
+`PILL_DANGER` (SOS red) near the top of the pill section. The pill surface
+gradient and hairline edge are in `_paint_surface()`, the soft shadow in
+`_paint_shadow()`.
 
-### Status Badge (Lines 924–927)
+### Hover behaviour
 
-The "Ready" text on the right side of the expanded bar.
+The pill polls the cursor every `POLL_MS` instead of relying on enter/leave
+events, which is steadier for a head-driven cursor. See `_poll()` and
+`_collapse_if_idle()`.
 
-| What to change | Where |
-|---|---|
-| **Default text** | Line 925: `"Ready"` |
-| **Updated programmatically** | via `self.status.setText(...)` throughout the class |
+---
 
-### Bar Stylesheet (Lines 935–996)
+## 🎯 5-Point Calibration Screen — `HeadCalibrationOverlay`
 
-All visual styling for the floating bar is in one stylesheet block:
-
-| CSS Selector | What it styles |
-|---|---|
-| `QFrame#barShell` | The bar's **background gradient, border, border-radius** |
-| `QLabel#idleDot` | Green dot in idle state |
-| `QLabel#idleLabel` | "OVERLAY" text in idle state |
-| `QLabel#brandLabel` | "● OPTIKINESIS" text in expanded state |
-| `QPushButton#barBtn` | Normal action buttons (Voice, Keys, Cam, Config) |
-| `QPushButton#barBtn:hover` | Hover glow effect on normal buttons |
-| `QPushButton#sosBarBtn` | SOS button (red themed) |
-| `QPushButton#sosBarBtn:hover` | Hover glow on SOS button |
-| `QLabel#barStatus` | "Ready" status badge |
-
-### Hover Behavior (Lines 1001–1025)
+Full-screen, nearly opaque screen that shows one target at a time: the
+center, then the four corners. Each point is captured automatically once the
+head has been steady for a second. The pill, panels, mini camera and cursor
+ring are hidden while it runs and restored afterwards.
 
 | What to change | Where |
 |---|---|
-| **Expand on hover** | `enterEvent()` at Line 1003 |
-| **Collapse delay** | `COLLAPSE_DELAY_MS = 1500` at Line 843 |
-| **Keep open when panel visible** | `leaveEvent()` at Line 1007 — checks `any(p.isVisible() ...)` |
+| **Target positions / corner inset** | `TARGET_INSET` and `default_targets()` in `head_calibration.py` |
+| **Timing** (travel, settle, steady time, timeout) | `CalibrationSession.__init__` defaults in `head_calibration.py` |
+| **How still the head must be** | `max_spread_deg` (degrees) in `CalibrationSession` |
+| **Minimum head movement accepted** | `MIN_SPAN_DEG` in `head_calibration.py` |
+| **Instruction and status text** | `_paint_text()` and `_status_lines()` |
+| **Target ring, pulse, colors** | `_paint_target()`, `RING_RADIUS`, `AMBER`, `GREEN` |
+| **Backdrop darkness** | alpha in `paintEvent()` (currently 240 of 255) |
+| **First-run auto start** | `_maybe_auto_calibrate()` and `AUTO_CALIBRATION_WAIT_S` |
 
 ---
 

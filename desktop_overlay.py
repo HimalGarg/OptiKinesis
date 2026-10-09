@@ -9,7 +9,7 @@ This module contains the PyQt5 floating overlay interface:
 - CameraOverlayPanel (live tracking video feed)
 - EmergencyOverlayPanel (SOS message/calls)
 - ControlOverlayPanel (cursor speed & sensitivity settings)
-- FloatingControlBar (main pill-shaped control bar)
+- FloatingControlBar (main pill-shaped control bar) & PillButton (its painted buttons)
 - GazeClickBridge & dispatch_blink_click (Qt click routing)
 """
 
@@ -26,6 +26,8 @@ try:
 except ImportError:
     wintypes = None
 
+from head_calibration import POINT_LABELS, CalibrationSession
+
 logger = logging.getLogger("optikinesis.overlay")
 
 try:
@@ -39,11 +41,11 @@ SCREEN_W, SCREEN_H = pyautogui.size()
 CENTER_X = SCREEN_W // 2
 CENTER_Y = SCREEN_H // 2
 
-TOP_MARGIN = 5
-BAR_IDLE_HEIGHT = 58
-BAR_EXPANDED_HEIGHT = 100
+TOP_MARGIN = 10
+BAR_IDLE_HEIGHT = 52
+BAR_EXPANDED_HEIGHT = 84
 BAR_HEIGHT = BAR_EXPANDED_HEIGHT
-PANEL_TOP_OFFSET = TOP_MARGIN + BAR_EXPANDED_HEIGHT + 14
+PANEL_TOP_OFFSET = TOP_MARGIN + BAR_EXPANDED_HEIGHT + 20
 LOCK_DELAY = 0.5
 DEBUG_BLINK_HUD = False
 
@@ -62,6 +64,12 @@ _frame_provider = None
 _voice_executor = None
 _fatigue_provider = None
 _shutdown_callback = None
+_status_provider = None
+_pose_provider = None
+_calibration_start = None
+_calibration_finish = None
+_calibration_needed = None
+_calibration_running = False
 
 gaze_click_bridge = None
 cursor_overlay_widget = None
@@ -70,14 +78,21 @@ keyboard_panel_widget = None
 mini_camera_widget = None
 notification_overlay_widget = None
 notification_bridge = None
+floating_bar_widget = None
+overlay_panel_widgets = {}
+calibration_overlay_widget = None
+calibration_bridge = None
 
 
 def configure_overlay(settings=None, action_executor=None, whatsapp_sender=None, 
                       frame_provider=None, voice_executor=None, fatigue_provider=None,
-                      shutdown_callback=None, lock_delay=0.5, debug_hud=False):
+                      shutdown_callback=None, lock_delay=0.5, debug_hud=False,
+                      status_provider=None, pose_provider=None, calibration_start=None,
+                      calibration_finish=None, calibration_needed=None):
     """Configure external callbacks and settings references from main application."""
     global _settings, _action_executor, _whatsapp_sender, _frame_provider, _voice_executor
-    global _fatigue_provider, _shutdown_callback, LOCK_DELAY, DEBUG_BLINK_HUD
+    global _fatigue_provider, _shutdown_callback, _status_provider, LOCK_DELAY, DEBUG_BLINK_HUD
+    global _pose_provider, _calibration_start, _calibration_finish, _calibration_needed
     if settings is not None:
         _settings = settings
     if action_executor is not None:
@@ -92,6 +107,16 @@ def configure_overlay(settings=None, action_executor=None, whatsapp_sender=None,
         _fatigue_provider = fatigue_provider
     if shutdown_callback is not None:
         _shutdown_callback = shutdown_callback
+    if status_provider is not None:
+        _status_provider = status_provider
+    if pose_provider is not None:
+        _pose_provider = pose_provider
+    if calibration_start is not None:
+        _calibration_start = calibration_start
+    if calibration_finish is not None:
+        _calibration_finish = calibration_finish
+    if calibration_needed is not None:
+        _calibration_needed = calibration_needed
     LOCK_DELAY = lock_delay
     DEBUG_BLINK_HUD = debug_hud
 
@@ -123,6 +148,24 @@ def dispatch_notification(message):
         notification_bridge.message_requested.emit(str(message))
     else:
         logger.info("Notification: %s", message)
+
+
+def start_head_calibration():
+    """Open the 5-point calibration screen.  Call from the Qt thread."""
+    if calibration_overlay_widget is None:
+        logger.warning("Calibration screen is not available")
+        return False
+    return calibration_overlay_widget.begin()
+
+
+def cancel_calibration():
+    """Cancel a running calibration from any thread (caregiver Esc/F12)."""
+    if PYQT5_AVAILABLE and calibration_bridge is not None:
+        calibration_bridge.cancel_requested.emit()
+
+
+def is_calibration_running():
+    return _calibration_running
 
 
 if PYQT5_AVAILABLE:
@@ -157,7 +200,7 @@ if PYQT5_AVAILABLE:
             self.timer.start(10)
 
         def update_position(self):
-            if _settings.get("overlay_enabled", True):
+            if _settings.get("overlay_enabled", True) and not _calibration_running:
                 x, y = pyautogui.position()
                 self.move(x - self.radius, y - self.radius)
                 self.draw_circle()
@@ -1099,7 +1142,7 @@ if PYQT5_AVAILABLE:
 
             for label_text, widget in [
                 ("Cursor Speed", self.speed_slider),
-                ("Cursor Scope (lower = more sensitive)", self.scope_spin),
+                ("Cursor Scope (only used until 5-point calibration is done)", self.scope_spin),
                 ("Blink Sensitivity", self.blink_spin),
                 ("Deliberate Blinks Per Click", self.blinks_required_spin),
                 ("Blink Sequence Window (seconds)", self.blink_window_spin),
@@ -1128,7 +1171,11 @@ if PYQT5_AVAILABLE:
             safety_row = QtWidgets.QHBoxLayout()
             self.body_layout.addLayout(safety_row)
 
-            calibrate_btn = QtWidgets.QPushButton("CALIBRATE CENTER")
+            head_calibration_btn = QtWidgets.QPushButton("5-POINT CALIBRATION")
+            head_calibration_btn.clicked.connect(self.start_calibration)
+            safety_row.addWidget(head_calibration_btn)
+
+            calibrate_btn = QtWidgets.QPushButton("RE-CENTER (F9)")
             calibrate_btn.clicked.connect(self.calibrate)
             safety_row.addWidget(calibrate_btn)
 
@@ -1140,7 +1187,8 @@ if PYQT5_AVAILABLE:
             exit_btn.clicked.connect(self.exit_application)
             safety_row.addWidget(exit_btn)
 
-            for btn in (save_btn, overlay_btn, mouse_btn, calibrate_btn, pause_btn, exit_btn):
+            for btn in (save_btn, overlay_btn, mouse_btn, head_calibration_btn,
+                        calibrate_btn, pause_btn, exit_btn):
                 btn.setMinimumHeight(52)
                 btn.setStyleSheet("""
                     border: 2px solid #355173;
@@ -1177,7 +1225,13 @@ if PYQT5_AVAILABLE:
 
         def calibrate(self):
             result = _perform_action("calibrate")
-            self.status.setText(result.get("message", result.get("status", "Calibration requested")))
+            self.status.setText(result.get("message", result.get("status", "Re-center requested")))
+
+        def start_calibration(self):
+            if start_head_calibration():
+                self.status.setText("5-point calibration started.")
+            else:
+                self.status.setText("Calibration needs the camera to be running.")
 
         def toggle_pause(self):
             result = _perform_action("toggle_pause")
@@ -1189,209 +1243,623 @@ if PYQT5_AVAILABLE:
             request_exit()
 
 
-    class FloatingControlBar(DraggableOverlayWidget):
-        """Floating control bar with idle/expanded hover states, pinned at top center.
+    # ─── FLOATING CONTROL PILL ───────────────────────────────────────────
+    #
+    # The pill is fully custom painted with antialiasing.  Qt stylesheet
+    # rounded corners render jagged on translucent windows, and resizing a
+    # frameless window makes it visibly jump, so the window keeps one fixed
+    # size and only the painted pill animates inside it.  A window mask keeps
+    # the unused transparent area click-through.
 
-        Idle: small rectangle showing 'OVERLAY' text.
-        Expanded (on hover): full bar with gaze-optimized icon buttons.
-        Auto-collapses when the gaze leaves (unless a panel is open).
+    PILL_FONT_FAMILY = "Segoe UI"
+    PILL_TEXT = QtGui.QColor(241, 245, 249)
+    PILL_TEXT_MUTED = QtGui.QColor(148, 160, 178)
+    PILL_ICON = QtGui.QColor(226, 232, 240)
+    PILL_ACCENT = QtGui.QColor(56, 189, 248)
+    PILL_DANGER = QtGui.QColor(248, 113, 113)
+    PILL_DANGER_TEXT = QtGui.QColor(252, 165, 165)
+    PILL_DANGER_BRIGHT = QtGui.QColor(255, 228, 228)
+
+    # Tracker state -> (status line text, indicator colour)
+    PILL_STATUS_STYLES = {
+        "tracking": ("Tracking", QtGui.QColor(52, 211, 153)),
+        "no_face": ("Face not detected", QtGui.QColor(251, 191, 36)),
+        "paused": ("Paused · F12 resumes", QtGui.QColor(248, 113, 113)),
+        "mouse_off": ("Mouse control off", QtGui.QColor(148, 163, 184)),
+        "no_camera": ("No camera found", QtGui.QColor(248, 113, 113)),
+        "ready": ("Ready", QtGui.QColor(52, 211, 153)),
+    }
+
+    def _pill_font(pixel_size, weight=QtGui.QFont.Normal):
+        font = QtGui.QFont(PILL_FONT_FAMILY)
+        font.setPixelSize(pixel_size)
+        font.setWeight(weight)
+        font.setStyleStrategy(QtGui.QFont.PreferAntialias)
+        return font
+
+    def _with_alpha(color, alpha):
+        result = QtGui.QColor(color)
+        result.setAlpha(max(0, min(255, int(alpha))))
+        return result
+
+    def _mix_colors(start, end, amount):
+        amount = max(0.0, min(1.0, float(amount)))
+        return QtGui.QColor(
+            int(start.red() + (end.red() - start.red()) * amount),
+            int(start.green() + (end.green() - start.green()) * amount),
+            int(start.blue() + (end.blue() - start.blue()) * amount),
+            int(start.alpha() + (end.alpha() - start.alpha()) * amount),
+        )
+
+    def _point_toward(origin, target, distance):
+        dx = target.x() - origin.x()
+        dy = target.y() - origin.y()
+        length = math.hypot(dx, dy) or 1.0
+        step = min(distance, length / 2.0) / length
+        return QtCore.QPointF(origin.x() + dx * step, origin.y() + dy * step)
+
+    def _rounded_polygon_path(points, radius):
+        """Closed polygon path whose corners are softened with quadratic curves."""
+        path = QtGui.QPainterPath()
+        count = len(points)
+        for index, corner in enumerate(points):
+            entry = _point_toward(corner, points[index - 1], radius)
+            leave = _point_toward(corner, points[(index + 1) % count], radius)
+            if index == 0:
+                path.moveTo(entry)
+            else:
+                path.lineTo(entry)
+            path.quadTo(corner, leave)
+        path.closeSubpath()
+        return path
+
+    def _draw_pill_icon(painter, name, rect, color):
+        """Draw a 24-unit line icon scaled into rect (replaces uneven emoji glyphs)."""
+        point = QtCore.QPointF
+        painter.save()
+        painter.translate(rect.topLeft())
+        painter.scale(rect.width() / 24.0, rect.height() / 24.0)
+        pen = QtGui.QPen(color, 2.0)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+
+        def dot(x, y):
+            painter.save()
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(point(x, y), 1.15, 1.15)
+            painter.restore()
+
+        if name == "mic":
+            painter.drawRoundedRect(QtCore.QRectF(9, 2, 6, 13), 3, 3)
+            arc = QtGui.QPainterPath(point(19, 10))
+            arc.lineTo(19, 12)
+            arc.arcTo(QtCore.QRectF(5, 5, 14, 14), 0, -180)
+            arc.lineTo(5, 10)
+            painter.drawPath(arc)
+            painter.drawLine(point(12, 19), point(12, 22))
+        elif name == "keyboard":
+            painter.drawRoundedRect(QtCore.QRectF(2, 4, 20, 16), 2.5, 2.5)
+            for x in (6, 10, 14, 18):
+                dot(x, 8)
+            for x in (8, 12, 16):
+                dot(x, 12)
+            painter.drawLine(point(7, 16), point(17, 16))
+        elif name == "camera":
+            painter.drawRoundedRect(QtCore.QRectF(2, 6, 14, 12), 2.5, 2.5)
+            painter.drawPolyline(QtGui.QPolygonF([
+                point(16, 10.5), point(21.5, 7.2), point(21.5, 16.8), point(16, 13.5),
+            ]))
+        elif name == "alert":
+            painter.drawPath(_rounded_polygon_path(
+                [point(12, 3), point(22, 20.5), point(2, 20.5)], 2.4
+            ))
+            painter.drawLine(point(12, 9.5), point(12, 13.5))
+            dot(12, 17)
+        elif name == "sliders":
+            for x1, x2, y in ((21, 14, 4), (10, 3, 4), (21, 12, 12),
+                              (8, 3, 12), (21, 16, 20), (12, 3, 20)):
+                painter.drawLine(point(x1, y), point(x2, y))
+            for x, y in ((14, 4), (8, 12), (16, 20)):
+                painter.drawLine(point(x, y - 2), point(x, y + 2))
+        painter.restore()
+
+
+    class PillButton(QtWidgets.QAbstractButton):
+        """Large painted icon button with animated hover, active and click feedback.
+
+        It stays a real QAbstractButton so GazeClickBridge can still press it
+        directly on a blink.
         """
 
-        IDLE_W = 280
+        WIDTH = 88
+        HEIGHT = 66
+        RADIUS = 16.0
+
+        def __init__(self, icon_name, label, parent=None, danger=False):
+            super().__init__(parent)
+            self.icon_name = icon_name
+            self.danger = danger
+            self.setText(label)
+            self.setAccessibleName(label)
+            self.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.setFixedSize(self.WIDTH, self.HEIGHT)
+
+            self._hovered = False
+            self._active = False
+            self._hover_level = 0.0
+            self._flash_level = 0.0
+            self._label_font = _pill_font(12, QtGui.QFont.DemiBold)
+
+            self._hover_anim = QtCore.QVariantAnimation(self)
+            self._hover_anim.setDuration(160)
+            self._hover_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            self._hover_anim.valueChanged.connect(self._on_hover_value)
+
+            # A short glow after each press confirms that a blink registered.
+            self._flash_anim = QtCore.QVariantAnimation(self)
+            self._flash_anim.setDuration(480)
+            self._flash_anim.setStartValue(1.0)
+            self._flash_anim.setEndValue(0.0)
+            self._flash_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            self._flash_anim.valueChanged.connect(self._on_flash_value)
+            self.clicked.connect(lambda _checked=False: self._start_flash())
+
+        def sizeHint(self):
+            return QtCore.QSize(self.WIDTH, self.HEIGHT)
+
+        def set_hovered(self, hovered):
+            hovered = bool(hovered)
+            if hovered == self._hovered:
+                return
+            self._hovered = hovered
+            self._hover_anim.stop()
+            self._hover_anim.setStartValue(self._hover_level)
+            self._hover_anim.setEndValue(1.0 if hovered else 0.0)
+            self._hover_anim.start()
+
+        def set_active(self, active):
+            active = bool(active)
+            if active != self._active:
+                self._active = active
+                self.update()
+
+        def _start_flash(self):
+            self._flash_anim.stop()
+            self._flash_anim.start()
+
+        def _on_hover_value(self, value):
+            self._hover_level = float(value)
+            self.update()
+
+        def _on_flash_value(self, value):
+            self._flash_level = float(value)
+            self.update()
+
+        def paintEvent(self, event):
+            bar = self.parentWidget()
+            reveal = float(getattr(bar, "content_reveal", 1.0))
+            if reveal <= 0.0:
+                return
+
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+            if hasattr(bar, "pill_clip_for"):
+                painter.setClipPath(bar.pill_clip_for(self))
+            painter.setOpacity(reveal)
+            painter.translate(0.0, (1.0 - reveal) * 6.0)
+
+            tone = PILL_DANGER if self.danger else PILL_ACCENT
+            emphasis = max(self._hover_level, 1.0 if self._active else 0.0)
+            card = QtCore.QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+
+            # Open panel: tinted fill plus an indicator bar under the label.
+            # Pointing at the button: a soft lift and an accent ring.
+            painter.setPen(QtCore.Qt.NoPen)
+            if self._active:
+                painter.setBrush(_with_alpha(tone, 34))
+                painter.drawRoundedRect(card, self.RADIUS, self.RADIUS)
+            if self._hover_level > 0.0:
+                painter.setBrush(_with_alpha(QtGui.QColor(255, 255, 255), 18 * self._hover_level))
+                painter.drawRoundedRect(card, self.RADIUS, self.RADIUS)
+            if self._flash_level > 0.0:
+                painter.setBrush(_with_alpha(tone, 130 * self._flash_level))
+                painter.drawRoundedRect(card, self.RADIUS, self.RADIUS)
+            if self._active:
+                painter.setBrush(tone)
+                painter.drawRoundedRect(
+                    QtCore.QRectF(self.width() / 2.0 - 8.0, self.height() - 7.0, 16.0, 3.0), 1.5, 1.5
+                )
+
+            if self._hover_level > 0.0:
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(_with_alpha(tone, 130 * self._hover_level), 1.2))
+                painter.drawRoundedRect(card, self.RADIUS, self.RADIUS)
+
+            if self.danger:
+                icon_color = _mix_colors(PILL_DANGER_TEXT, PILL_DANGER_BRIGHT, emphasis)
+                label_color = icon_color
+            else:
+                icon_color = _mix_colors(PILL_ICON, tone, emphasis)
+                label_color = _mix_colors(PILL_TEXT_MUTED, PILL_TEXT, emphasis)
+
+            icon_size = 24.0
+            icon_rect = QtCore.QRectF((self.width() - icon_size) / 2.0, 11.0, icon_size, icon_size)
+            _draw_pill_icon(painter, self.icon_name, icon_rect, icon_color)
+
+            painter.setFont(self._label_font)
+            painter.setPen(label_color)
+            painter.drawText(
+                QtCore.QRectF(0.0, 40.0, float(self.width()), 18.0),
+                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+                self.text(),
+            )
+            painter.end()
+
+
+    class FloatingControlBar(DraggableOverlayWidget):
+        """Floating status pill pinned at top center.
+
+        Collapsed, it shows the brand and the live tracking state.  When the
+        cursor rests on it, it grows smoothly into a toolbar of large
+        gaze-friendly buttons, and it folds back shortly after the cursor
+        leaves unless a panel or the voice prompt is open.
+        """
+
+        IDLE_W = 196
         IDLE_H = BAR_IDLE_HEIGHT
-        EXPANDED_W = 780
         EXPANDED_H = BAR_EXPANDED_HEIGHT
-        COLLAPSE_DELAY_MS = 1500
+        PAD = 14
+        BRAND_W = 168
+        DIVIDER_GAP = 12
+        BUTTON_GAP = 6
+        BUTTON_OFFSET = PAD + BRAND_W + 2 * DIVIDER_GAP + 1
+        EXPANDED_W = BUTTON_OFFSET + 5 * PillButton.WIDTH + 4 * BUTTON_GAP + PAD
+
+        SHADOW_X = 18
+        SHADOW_TOP = 8
+        SHADOW_BOTTOM = 20
+        SHADOW_SPREAD = 12
+        SHADOW_DROP = 4
+
+        EXPAND_MS = 280
+        COLLAPSE_MS = 220
+        COLLAPSE_DELAY_MS = 1200
+        HOVER_SLOP = 10
+        POLL_MS = 40
+        MESSAGE_MS = 4500
+
+        BUTTON_SPECS = (
+            ("voice", "mic", "Voice", False),
+            ("keyboard", "keyboard", "Keyboard", False),
+            ("camera", "camera", "Camera", False),
+            ("emergency", "alert", "SOS", True),
+            ("control", "sliders", "Settings", False),
+        )
 
         def __init__(self, panels):
-            super().__init__(width=self.IDLE_W, height=self.IDLE_H)
+            window_w = self.EXPANDED_W + 2 * self.SHADOW_X
+            window_h = self.EXPANDED_H + self.SHADOW_TOP + self.SHADOW_BOTTOM
+            super().__init__(width=window_w, height=window_h)
             self.panels = panels
             self.voice_enabled = False
-            self._is_expanded = False
 
-            # Timer for auto-collapse after cursor leaves
+            self._progress = 0.0
+            self._expanded = False
+            self._status_key = "ready"
+            self._message = ""
+            self._title_font = _pill_font(15, QtGui.QFont.DemiBold)
+            self._title_font.setLetterSpacing(QtGui.QFont.AbsoluteSpacing, 0.2)
+            self._status_font = _pill_font(12)
+
+            self._anim = QtCore.QVariantAnimation(self)
+            self._anim.valueChanged.connect(self._on_progress)
+            self._anim.finished.connect(self._on_animation_finished)
+
             self._collapse_timer = QtCore.QTimer(self)
             self._collapse_timer.setSingleShot(True)
-            self._collapse_timer.timeout.connect(self._do_collapse)
+            self._collapse_timer.timeout.connect(self._collapse_if_idle)
 
-            # Root layout
-            root = QtWidgets.QVBoxLayout(self)
-            root.setContentsMargins(0, 0, 0, 0)
+            self._message_timer = QtCore.QTimer(self)
+            self._message_timer.setSingleShot(True)
+            self._message_timer.timeout.connect(self._clear_message)
 
-            # Shell frame (the visible bar background)
-            self.shell = QtWidgets.QFrame(self)
-            self.shell.setObjectName("barShell")
-            root.addWidget(self.shell)
+            self.buttons = {}
+            for key, icon, label, danger in self.BUTTON_SPECS:
+                button = PillButton(icon, label, self, danger=danger)
+                button.hide()
+                self.buttons[key] = button
+            self.buttons["voice"].clicked.connect(self.toggle_voice)
+            for key in ("keyboard", "camera", "emergency", "control"):
+                self.buttons[key].clicked.connect(
+                    lambda _checked=False, name=key: self.toggle_panel(name)
+                )
+            self._layout_buttons()
 
-            # Stacked layout to switch between idle and expanded views
-            self.stack = QtWidgets.QStackedLayout(self.shell)
-            self.stack.setContentsMargins(0, 0, 0, 0)
+            self.set_fixed_position((SCREEN_W - window_w) // 2, TOP_MARGIN - self.SHADOW_TOP)
+            self._apply_mask(0.0)
+            self._refresh_status()
 
-            # ─── IDLE PAGE ────────────────────────────────────────────────────
-            idle_page = QtWidgets.QWidget()
-            idle_layout = QtWidgets.QHBoxLayout(idle_page)
-            idle_layout.setContentsMargins(16, 0, 16, 0)
-            idle_layout.setAlignment(QtCore.Qt.AlignCenter)
+            # Polling the cursor is steadier than enter/leave events for a
+            # head-driven cursor that moves in small jumps.
+            self._poll_timer = QtCore.QTimer(self)
+            self._poll_timer.timeout.connect(self._poll)
+            self._poll_timer.start(self.POLL_MS)
 
-            dot = QtWidgets.QLabel("●")
-            dot.setObjectName("idleDot")
-            idle_layout.addWidget(dot)
+        # ─── GEOMETRY ────────────────────────────────────────────────────
 
-            idle_label = QtWidgets.QLabel("OVERLAY")
-            idle_label.setObjectName("idleLabel")
-            idle_layout.addWidget(idle_label)
+        @property
+        def content_reveal(self):
+            """0 while collapsed, rising to 1 over the last half of the expansion."""
+            return max(0.0, min(1.0, (self._progress - 0.45) / 0.55))
 
-            self.stack.addWidget(idle_page)  # index 0
+        def _pill_rect(self, progress=None):
+            progress = self._progress if progress is None else progress
+            width = self.IDLE_W + (self.EXPANDED_W - self.IDLE_W) * progress
+            height = self.IDLE_H + (self.EXPANDED_H - self.IDLE_H) * progress
+            left = (self.width() - width) / 2.0
+            return QtCore.QRectF(left, float(self.SHADOW_TOP), width, height)
 
-            # ─── EXPANDED PAGE ────────────────────────────────────────────────
-            expanded_page = QtWidgets.QWidget()
-            exp_layout = QtWidgets.QHBoxLayout(expanded_page)
-            exp_layout.setContentsMargins(18, 8, 18, 8)
-            exp_layout.setSpacing(10)
+        def _pill_path(self):
+            rect = self._pill_rect()
+            radius = rect.height() / 2.0
+            path = QtGui.QPainterPath()
+            path.addRoundedRect(rect, radius, radius)
+            return path
 
-            # Brand label
-            brand = QtWidgets.QLabel("●  OPTIKINESIS")
-            brand.setObjectName("brandLabel")
-            exp_layout.addWidget(brand)
+        def pill_clip_for(self, child):
+            """Current pill outline in a child's coordinates, used to clip its paint."""
+            return self._pill_path().translated(-child.x(), -child.y())
 
-            # Vertical separator
-            sep = QtWidgets.QFrame()
-            sep.setFrameShape(QtWidgets.QFrame.VLine)
-            sep.setFixedWidth(2)
-            sep.setStyleSheet("color: rgba(45, 80, 120, 180);")
-            exp_layout.addWidget(sep)
+        def accepts_gaze_point(self, global_point):
+            """True when a global point lies on the visible pill, not the clear margin."""
+            local = self.mapFromGlobal(global_point)
+            return self._pill_rect().contains(QtCore.QPointF(local))
 
-            # Action buttons
-            buttons_spec = [
-                ("🎤", "Voice",  self.toggle_voice,                        False),
-                ("⌨",  "Keys",   lambda: self.toggle_panel("keyboard"),    False),
-                ("📷", "Cam",    lambda: self.toggle_panel("camera"),      False),
-                ("🚨", "SOS",    lambda: self.toggle_panel("emergency"),   True),
-                ("⚙",  "Config", lambda: self.toggle_panel("control"),     False),
-            ]
+        def _layout_buttons(self):
+            rect = self._pill_rect()
+            x = rect.left() + self.BUTTON_OFFSET
+            y = rect.top() + (rect.height() - PillButton.HEIGHT) / 2.0
+            for key, _icon, _label, _danger in self.BUTTON_SPECS:
+                self.buttons[key].move(int(round(x)), int(round(y)))
+                x += PillButton.WIDTH + self.BUTTON_GAP
 
-            self._action_buttons = []
-            for icon, label, callback, is_sos in buttons_spec:
-                btn = QtWidgets.QPushButton(f"{icon}  {label}")
-                btn.setObjectName("sosBarBtn" if is_sos else "barBtn")
-                btn.setFixedSize(110, 64)
-                btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-                btn.clicked.connect(callback)
-                exp_layout.addWidget(btn)
-                self._action_buttons.append(btn)
+        def _apply_mask(self, progress):
+            """Limit the window's clickable area to the pill and its shadow."""
+            area = self._pill_rect(progress).adjusted(
+                -self.SHADOW_X, -self.SHADOW_TOP, self.SHADOW_X, self.SHADOW_BOTTOM
+            )
+            self.setMask(QtGui.QRegion(area.toAlignedRect().intersected(self.rect())))
 
-            exp_layout.addStretch(1)
+        # ─── EXPAND / COLLAPSE ───────────────────────────────────────────
 
-            # Status badge
-            self.status = QtWidgets.QLabel("Ready")
-            self.status.setObjectName("barStatus")
-            exp_layout.addWidget(self.status)
-
-            self.stack.addWidget(expanded_page)  # index 1
-
-            # Start on idle
-            self.stack.setCurrentIndex(0)
-
-            # ─── STYLESHEET ──────────────────────────────────────────────────
-            self.setStyleSheet("""
-                QFrame#barShell {
-                    background: qlineargradient(
-                        x1:0, y1:0, x2:1, y2:0,
-                        stop:0 rgba(8, 14, 24, 240),
-                        stop:1 rgba(14, 22, 36, 240)
-                    );
-                    border: 1.5px solid rgba(45, 212, 255, 60);
-                    border-radius: 26px;
-                }
-                QLabel#idleDot {
-                    color: #3dda9b;
-                    font-size: 16px;
-                    font-weight: 900;
-                    padding-right: 4px;
-                }
-                QLabel#idleLabel {
-                    color: #ffffff;
-                    font-size: 20px;
-                    font-weight: 900;
-                    letter-spacing: 5px;
-                }
-                QLabel#brandLabel {
-                    color: #3dda9b;
-                    font-size: 17px;
-                    font-weight: 900;
-                    letter-spacing: 2px;
-                    padding-right: 4px;
-                }
-                QPushButton#barBtn {
-                    background: rgba(18, 30, 48, 245);
-                    border: 2px solid #2d4a6a;
-                    border-radius: 16px;
-                    color: #e0f0ff;
-                    font-size: 16px;
-                    font-weight: 800;
-                }
-                QPushButton#barBtn:hover {
-                    border-color: #2dd4ff;
-                    color: #2dd4ff;
-                    background: rgba(45, 212, 255, 25);
-                }
-                QPushButton#sosBarBtn {
-                    background: rgba(80, 20, 20, 245);
-                    border: 2px solid #8b3a3a;
-                    border-radius: 16px;
-                    color: #ffd4d4;
-                    font-size: 16px;
-                    font-weight: 800;
-                }
-                QPushButton#sosBarBtn:hover {
-                    border-color: #ff6161;
-                    color: #ff6161;
-                    background: rgba(255, 97, 97, 35);
-                }
-                QLabel#barStatus {
-                    color: #7a99b8;
-                    font-size: 16px;
-                    font-weight: 700;
-                    padding-right: 10px;
-                }
-            """)
-
-            # Position idle bar at top center
-            self.set_fixed_position((SCREEN_W - self.IDLE_W) // 2, TOP_MARGIN)
-
-        # ─── HOVER EXPAND / COLLAPSE ─────────────────────────────────────
-
-        def enterEvent(self, event):
+        def expand(self):
             self._collapse_timer.stop()
-            self._do_expand()
-            super().enterEvent(event)
+            if self._expanded:
+                return
+            self._expanded = True
+            self._animate_to(1.0)
 
-        def leaveEvent(self, event):
-            # Keep expanded if any panel is currently open
-            if any(p.isVisible() for p in self.panels.values()):
-                super().leaveEvent(event)
+        def collapse(self):
+            if not self._expanded:
                 return
-            self._collapse_timer.start(self.COLLAPSE_DELAY_MS)
-            super().leaveEvent(event)
+            self._expanded = False
+            self._animate_to(0.0)
 
-        def _do_expand(self):
-            if self._is_expanded:
+        def _animate_to(self, target):
+            self._anim.stop()
+            distance = abs(target - self._progress)
+            if distance < 0.001:
+                self._on_progress(target)
+                self._on_animation_finished()
                 return
-            self._is_expanded = True
-            self.setFixedSize(self.EXPANDED_W, self.EXPANDED_H)
-            self.set_fixed_position((SCREEN_W - self.EXPANDED_W) // 2, TOP_MARGIN)
-            self.stack.setCurrentIndex(1)
+            expanding = target > self._progress
+            if expanding:
+                self._apply_mask(1.0)
+                for button in self.buttons.values():
+                    button.show()
+            duration = self.EXPAND_MS if expanding else self.COLLAPSE_MS
+            self._anim.setStartValue(float(self._progress))
+            self._anim.setEndValue(float(target))
+            self._anim.setDuration(max(90, int(duration * distance)))
+            self._anim.setEasingCurve(
+                QtCore.QEasingCurve.OutCubic if expanding else QtCore.QEasingCurve.InOutCubic
+            )
+            self._anim.start()
 
-        def _do_collapse(self):
-            if not self._is_expanded:
+        def _on_progress(self, value):
+            self._progress = max(0.0, min(1.0, float(value)))
+            self._layout_buttons()
+            self.update()
+
+        def _on_animation_finished(self):
+            if not self._expanded and self._progress <= 0.001:
+                self._progress = 0.0
+                for button in self.buttons.values():
+                    button.set_hovered(False)
+                    button.hide()
+                self._apply_mask(0.0)
+            self.update()
+
+        def _cursor_over_pill(self, slop):
+            local = QtCore.QPointF(self.mapFromGlobal(QtGui.QCursor.pos()))
+            return self._pill_rect().adjusted(-slop, -slop, slop, slop).contains(local)
+
+        def _any_panel_visible(self):
+            return any(panel.isVisible() for panel in self.panels.values())
+
+        def _poll(self):
+            cursor = self.mapFromGlobal(QtGui.QCursor.pos())
+            slop = self.HOVER_SLOP if self._expanded else 2
+            over_pill = self._pill_rect().adjusted(-slop, -slop, slop, slop).contains(
+                QtCore.QPointF(cursor)
+            )
+
+            if over_pill:
+                self.expand()
+            elif self._expanded:
+                if self._any_panel_visible() or self.voice_enabled:
+                    self._collapse_timer.stop()
+                elif not self._collapse_timer.isActive():
+                    self._collapse_timer.start(self.COLLAPSE_DELAY_MS)
+
+            interactive = self.content_reveal > 0.85
+            for button in self.buttons.values():
+                button.set_hovered(
+                    interactive and button.isVisible() and button.geometry().contains(cursor)
+                )
+            self._sync_active_states()
+            self._refresh_status()
+
+        def _collapse_if_idle(self):
+            if self._cursor_over_pill(self.HOVER_SLOP):
                 return
-            # Don't collapse while a panel is visible
-            if any(p.isVisible() for p in self.panels.values()):
+            if self._any_panel_visible() or self.voice_enabled:
                 return
-            self._is_expanded = False
-            self.stack.setCurrentIndex(0)
-            self.setFixedSize(self.IDLE_W, self.IDLE_H)
-            self.set_fixed_position((SCREEN_W - self.IDLE_W) // 2, TOP_MARGIN)
+            self.collapse()
+
+        def mousePressEvent(self, event):
+            if self._pill_rect().contains(QtCore.QPointF(event.pos())):
+                self.expand()
+                event.accept()
+                return
+            event.ignore()
+
+        # ─── STATUS ──────────────────────────────────────────────────────
+
+        def _refresh_status(self):
+            key = "ready"
+            if _status_provider is not None:
+                try:
+                    key = _status_provider() or "ready"
+                except Exception as exc:
+                    logger.debug("Status provider failed: %s", exc)
+            elif _settings.get("system_paused", False):
+                key = "paused"
+            if key not in PILL_STATUS_STYLES:
+                key = "ready"
+            if key != self._status_key:
+                self._status_key = key
+                self.update()
+
+        def show_status_message(self, text):
+            """Show a short-lived message in the status line, then fall back to state."""
+            self._message = str(text or "").strip()
+            self._message_timer.start(self.MESSAGE_MS)
+            self.update()
+
+        def _clear_message(self):
+            self._message = ""
+            self.update()
+
+        def _sync_active_states(self):
+            for name, button in self.buttons.items():
+                if name == "voice":
+                    button.set_active(self.voice_enabled)
+                else:
+                    panel = self.panels.get(name)
+                    button.set_active(panel is not None and panel.isVisible())
+
+        # ─── PAINTING ────────────────────────────────────────────────────
+
+        def paintEvent(self, event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+            rect = self._pill_rect()
+            radius = rect.height() / 2.0
+            self._paint_shadow(painter, rect, radius)
+            self._paint_surface(painter, rect, radius)
+            self._paint_brand(painter, rect)
+            self._paint_divider(painter, rect)
+            painter.end()
+
+        def _paint_shadow(self, painter, rect, radius):
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(0, 0, 0, 9))
+            base = rect.translated(0.0, self.SHADOW_DROP)
+            layers = 8
+            for index in range(layers, 0, -1):
+                spread = self.SHADOW_SPREAD * index / layers
+                painter.drawRoundedRect(
+                    base.adjusted(-spread, -spread, spread, spread),
+                    radius + spread,
+                    radius + spread,
+                )
+
+        def _paint_surface(self, painter, rect, radius):
+            fill = QtGui.QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            fill.setColorAt(0.0, QtGui.QColor(30, 35, 46, 242))
+            fill.setColorAt(1.0, QtGui.QColor(15, 18, 26, 246))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QBrush(fill))
+            painter.drawRoundedRect(rect, radius, radius)
+
+            # Hairline edge, brighter along the top, for a glassy finish.
+            edge = QtGui.QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            edge.setColorAt(0.0, QtGui.QColor(255, 255, 255, 48))
+            edge.setColorAt(0.5, QtGui.QColor(255, 255, 255, 18))
+            edge.setColorAt(1.0, QtGui.QColor(255, 255, 255, 12))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(QtGui.QBrush(edge), 1.0))
+            inner = rect.adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.drawRoundedRect(inner, radius - 0.5, radius - 0.5)
+
+        def _paint_brand(self, painter, rect):
+            label, color = PILL_STATUS_STYLES.get(self._status_key, PILL_STATUS_STYLES["ready"])
+            center_y = rect.center().y()
+
+            dot_center = QtCore.QPointF(rect.left() + self.PAD + 7.0, center_y)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(_with_alpha(color, 48))
+            painter.drawEllipse(dot_center, 8.0, 8.0)
+            painter.setBrush(color)
+            painter.drawEllipse(dot_center, 4.0, 4.0)
+
+            text_left = dot_center.x() + 16.0
+            available = max(
+                0.0,
+                min(
+                    rect.left() + self.PAD + self.BRAND_W - text_left,
+                    rect.right() - self.PAD - text_left,
+                ),
+            )
+            title_metrics = QtGui.QFontMetricsF(self._title_font)
+            status_metrics = QtGui.QFontMetricsF(self._status_font)
+            block_h = title_metrics.height() + status_metrics.height()
+            top = center_y - block_h / 2.0
+
+            painter.setFont(self._title_font)
+            painter.setPen(PILL_TEXT)
+            painter.drawText(
+                QtCore.QRectF(text_left, top, available, title_metrics.height()),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                "OptiKinesis",
+            )
+
+            status_text = self._message or label
+            status_color = PILL_TEXT if self._message else _mix_colors(PILL_TEXT_MUTED, color, 0.45)
+            painter.setFont(self._status_font)
+            painter.setPen(status_color)
+            painter.drawText(
+                QtCore.QRectF(text_left, top + title_metrics.height(), available, status_metrics.height()),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                status_metrics.elidedText(status_text, QtCore.Qt.ElideRight, available),
+            )
+
+        def _paint_divider(self, painter, rect):
+            reveal = self.content_reveal
+            if reveal <= 0.0:
+                return
+            x = rect.left() + self.PAD + self.BRAND_W + self.DIVIDER_GAP + 0.5
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, int(28 * reveal)), 1.0))
+            painter.drawLine(
+                QtCore.QPointF(x, rect.top() + 20.0),
+                QtCore.QPointF(x, rect.bottom() - 20.0),
+            )
 
         # ─── PANEL TOGGLE ────────────────────────────────────────────────
 
@@ -1408,55 +1876,335 @@ if PYQT5_AVAILABLE:
                 panel.show()
                 panel.raise_()
                 panel.activateWindow()
-                # Keep bar expanded while panel is open
                 self._collapse_timer.stop()
-            else:
-                # Panel closed — schedule collapse
-                self._collapse_timer.start(self.COLLAPSE_DELAY_MS)
+            self._sync_active_states()
 
         # ─── VOICE INPUT ─────────────────────────────────────────────────
 
         def toggle_voice(self):
-            self.voice_enabled = not self.voice_enabled
-            if not self.voice_enabled:
-                self.status.setText("Voice idle")
-                return
-
-            if _voice_executor is None:
+            if self.voice_enabled:
+                return  # A voice prompt is already open.
+            self.voice_enabled = True
+            self._sync_active_states()
+            try:
                 text, ok = QtWidgets.QInputDialog.getText(
                     self, "Voice Command", "Enter voice command text:", QtWidgets.QLineEdit.Normal, ""
                 )
-                if not ok or not text.strip():
-                    self.voice_enabled = False
-                    self.status.setText("Canceled")
+                text = text.strip()
+                if not ok or not text:
+                    self.show_status_message("Voice command cancelled")
                     return
-                self.status.setText(f"Entered: {text}")
-                self.voice_enabled = False
-                return
+                if _voice_executor is None:
+                    self.show_status_message(f"Entered: {text}")
+                    return
 
-            text, ok = QtWidgets.QInputDialog.getText(
-                self, "Voice Command", "Enter voice command text:", QtWidgets.QLineEdit.Normal, ""
+                result = _voice_executor.process_command(text)
+                if result.get("status") == "pending_confirmation":
+                    confirm = QtWidgets.QMessageBox.question(
+                        self,
+                        "Confirm Action",
+                        result.get("description", "Confirm pending action?"),
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+                    )
+                    if confirm == QtWidgets.QMessageBox.Yes:
+                        result = _voice_executor.confirm_pending()
+                    else:
+                        result = _voice_executor.cancel_pending()
+                self.show_status_message(result.get("message", result.get("status", "Done")))
+            finally:
+                self.voice_enabled = False
+                self._sync_active_states()
+
+
+    # ─── 5-POINT HEAD CALIBRATION SCREEN ─────────────────────────────────
+
+    class CalibrationBridge(QtCore.QObject):
+        """Delivers cancel requests from the hotkey thread to the Qt thread."""
+
+        cancel_requested = QtCore.pyqtSignal()
+
+        def __init__(self, overlay):
+            super().__init__()
+            self.cancel_requested.connect(overlay.cancel, QtCore.Qt.QueuedConnection)
+
+
+    class HeadCalibrationOverlay(QtWidgets.QWidget):
+        """Full-screen 5-point head calibration.
+
+        Shows one target at a time: the center, then the four corners.  The
+        user turns their head comfortably toward the dot and holds still; each
+        point is captured automatically once the head is steady, so no blinks
+        are needed.  Cursor movement and blink clicks are suspended while it
+        runs.  A caregiver can cancel with Esc or F12.
+        """
+
+        TICK_MS = 16
+        DONE_HOLD_S = 1.1
+        RING_RADIUS = 34.0
+        AMBER = QtGui.QColor(251, 191, 36)
+        GREEN = QtGui.QColor(52, 211, 153)
+
+        def __init__(self):
+            super().__init__()
+            self.setWindowFlags(
+                QtCore.Qt.FramelessWindowHint
+                | QtCore.Qt.WindowStaysOnTopHint
+                | QtCore.Qt.Tool
+                | QtCore.Qt.WindowDoesNotAcceptFocus
             )
-            if not ok or not text.strip():
-                self.voice_enabled = False
-                self.status.setText("Canceled")
-                return
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+            self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+            self.setGeometry(0, 0, SCREEN_W, SCREEN_H)
 
-            result = _voice_executor.process_command(text.strip())
-            if result.get("status") == "pending_confirmation":
-                confirm = QtWidgets.QMessageBox.question(
-                    self,
-                    "Confirm Action",
-                    result.get("description", "Confirm pending action?"),
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            self.session = None
+            self._hidden_widgets = []
+            self._done_since = None
+            self._last_state = None
+            self._last_target_rect = QtCore.QRect()
+            self._ticks = 0
+
+            self._title_font = _pill_font(30, QtGui.QFont.DemiBold)
+            self._body_font = _pill_font(18)
+            self._step_font = _pill_font(15, QtGui.QFont.DemiBold)
+            self._status_font = _pill_font(16, QtGui.QFont.DemiBold)
+            self._hint_font = _pill_font(13)
+
+            self._timer = QtCore.QTimer(self)
+            self._timer.setTimerType(QtCore.Qt.PreciseTimer)
+            self._timer.timeout.connect(self._tick)
+            self.hide()
+
+        @property
+        def running(self):
+            return self.session is not None
+
+        # ─── lifecycle ───────────────────────────────────────────────────
+
+        def begin(self):
+            global _calibration_running
+            if self.running:
+                return True
+            if _pose_provider is None:
+                return False
+            self.session = CalibrationSession()
+            self.session.start(time.monotonic())
+            self._done_since = None
+            self._last_state = None
+            self._hide_other_overlays()
+            _calibration_running = True
+            if _calibration_start is not None:
+                try:
+                    _calibration_start()
+                except Exception as exc:
+                    logger.warning("Calibration start hook failed: %s", exc)
+            self.show()
+            self.raise_()
+            self._timer.start(self.TICK_MS)
+            return True
+
+        def cancel(self):
+            if self.session is not None:
+                self.session.cancel("Calibration cancelled.")
+
+        def _finish(self):
+            global _calibration_running
+            session = self.session
+            self._timer.stop()
+            self.session = None
+            self.hide()
+            _calibration_running = False
+            self._restore_other_overlays()
+
+            model = None
+            if session is not None and session.phase == CalibrationSession.DONE:
+                model = session.result
+            saved = False
+            if _calibration_finish is not None:
+                try:
+                    saved = bool(_calibration_finish(model))
+                except Exception as exc:
+                    logger.error("Applying calibration failed: %s", exc)
+            if model is not None:
+                message = (
+                    "Calibration saved. Press F9 any time to re-center."
+                    if saved
+                    else "Calibration applied for this session but could not be saved."
                 )
-                if confirm == QtWidgets.QMessageBox.Yes:
-                    result = _voice_executor.confirm_pending()
-                else:
-                    result = _voice_executor.cancel_pending()
+            else:
+                reason = session.error if session is not None and session.error else "Calibration stopped."
+                message = f"{reason} Previous settings kept."
+            dispatch_notification(message)
 
-            self.status.setText(result.get("message", result.get("status", "Done")))
-            self.voice_enabled = False
+        def _hide_other_overlays(self):
+            candidates = [floating_bar_widget, mini_camera_widget, blink_debug_overlay_widget]
+            candidates.extend(overlay_panel_widgets.values())
+            self._hidden_widgets = [w for w in candidates if w is not None and w.isVisible()]
+            for widget in self._hidden_widgets:
+                widget.hide()
+            if cursor_overlay_widget is not None:
+                cursor_overlay_widget.hide()
+
+        def _restore_other_overlays(self):
+            for widget in self._hidden_widgets:
+                widget.show()
+            self._hidden_widgets = []
+
+        # ─── animation tick ──────────────────────────────────────────────
+
+        def _tick(self):
+            session = self.session
+            if session is None:
+                self._timer.stop()
+                return
+            try:
+                now = time.monotonic()
+                pose = _pose_provider() if _pose_provider is not None else None
+                session.update(now, pose)
+
+                if session.phase == CalibrationSession.FAILED:
+                    self._finish()
+                    return
+                if session.phase == CalibrationSession.DONE:
+                    if self._done_since is None:
+                        self._done_since = now
+                    elif now - self._done_since >= self.DONE_HOLD_S:
+                        self._finish()
+                        return
+
+                # Repaint everything when the text or markers change; otherwise
+                # only the small area around the moving, pulsing target.
+                state = (session.phase, session.index, session.face_visible, len(session.readings))
+                target_rect = self._target_rect(session, now)
+                if state != self._last_state:
+                    self._last_state = state
+                    self.update()
+                else:
+                    self.update(target_rect.united(self._last_target_rect))
+                self._last_target_rect = target_rect
+
+                self._ticks += 1
+                if self._ticks % 30 == 0:
+                    self.raise_()
+            except Exception as exc:
+                logger.exception("Calibration screen error: %s", exc)
+                if self.session is not None:
+                    self.session.cancel("Calibration stopped because of an error.")
+                self._finish()
+
+        def _target_point(self, session, now):
+            nx, ny = session.target_position(now)
+            return QtCore.QPointF(nx * self.width(), ny * self.height())
+
+        def _target_rect(self, session, now):
+            point = self._target_point(session, now)
+            reach = int(self.RING_RADIUS + 24)
+            return QtCore.QRect(int(point.x()) - reach, int(point.y()) - reach, 2 * reach, 2 * reach)
+
+        # ─── painting ────────────────────────────────────────────────────
+
+        def paintEvent(self, event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+            # Nearly opaque so background content doesn't pull the eye away.
+            painter.fillRect(event.rect(), QtGui.QColor(7, 10, 17, 240))
+            session = self.session
+            if session is not None:
+                now = time.monotonic()
+                self._paint_text(painter, session)
+                self._paint_completed(painter, session)
+                self._paint_target(painter, session, now)
+            painter.end()
+
+        def _status_lines(self, session):
+            if session.phase == CalibrationSession.DONE:
+                return "All 5 points captured", "Calibration complete", self.GREEN
+            label = POINT_LABELS[session.point_name]
+            step = f"Point {session.index + 1} of {session.point_count}  ·  {label}"
+            if not session.face_visible:
+                return step, "Face not detected. Look toward the screen.", self.AMBER
+            if session.phase == CalibrationSession.TRAVEL:
+                return step, "Follow the dot", PILL_ACCENT
+            return step, "Hold still…", PILL_ACCENT
+
+        def _paint_text(self, painter, session):
+            width = float(self.width())
+            # Keep the 180 px text block clear of the center target on short screens.
+            top = min(self.height() * 0.22, self.height() * 0.5 - self.RING_RADIUS - 24 - 180)
+            center = QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter
+
+            painter.setFont(self._title_font)
+            painter.setPen(PILL_TEXT)
+            painter.drawText(QtCore.QRectF(0, top, width, 44), center, "Head calibration")
+
+            painter.setFont(self._body_font)
+            painter.setPen(QtGui.QColor(203, 213, 225))
+            painter.drawText(
+                QtCore.QRectF(0, top + 50, width, 28),
+                center,
+                "Turn your head comfortably toward the dot and hold still.",
+            )
+
+            step, status, color = self._status_lines(session)
+            painter.setFont(self._step_font)
+            painter.setPen(PILL_TEXT_MUTED)
+            painter.drawText(QtCore.QRectF(0, top + 92, width, 24), center, step)
+
+            painter.setFont(self._status_font)
+            painter.setPen(color)
+            painter.drawText(QtCore.QRectF(0, top + 122, width, 26), center, status)
+
+            painter.setFont(self._hint_font)
+            painter.setPen(_with_alpha(PILL_TEXT_MUTED, 190))
+            painter.drawText(
+                QtCore.QRectF(0, top + 158, width, 22),
+                center,
+                "Caregiver: press Esc or F12 to cancel",
+            )
+
+        def _paint_completed(self, painter, session):
+            painter.setPen(QtCore.Qt.NoPen)
+            for name in session.completed_points():
+                nx, ny = session.targets[name]
+                point = QtCore.QPointF(nx * self.width(), ny * self.height())
+                painter.setBrush(_with_alpha(self.GREEN, 50))
+                painter.drawEllipse(point, 12.0, 12.0)
+                painter.setBrush(self.GREEN)
+                painter.drawEllipse(point, 6.0, 6.0)
+
+        def _paint_target(self, painter, session, now):
+            point = self._target_point(session, now)
+            if session.phase == CalibrationSession.DONE:
+                tone = self.GREEN
+            elif not session.face_visible:
+                tone = self.AMBER
+            else:
+                tone = PILL_ACCENT
+
+            pulse = 0.5 + 0.5 * math.sin(now * 4.2)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(_with_alpha(tone, 36 + 34 * pulse))
+            halo = 16.0 + 5.0 * pulse
+            painter.drawEllipse(point, halo, halo)
+
+            if session.phase != CalibrationSession.TRAVEL:
+                radius = self.RING_RADIUS
+                ring = QtCore.QRectF(point.x() - radius, point.y() - radius, 2 * radius, 2 * radius)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 48), 4.0))
+                painter.drawEllipse(ring)
+                progress = session.progress
+                if progress > 0.0:
+                    pen = QtGui.QPen(tone, 4.0)
+                    pen.setCapStyle(QtCore.Qt.RoundCap)
+                    painter.setPen(pen)
+                    painter.drawArc(ring, 90 * 16, -int(round(360 * 16 * progress)))
+
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(255, 255, 255))
+            painter.drawEllipse(point, 7.0, 7.0)
+            painter.setBrush(tone)
+            painter.drawEllipse(point, 3.0, 3.0)
 
 
     class GazeClickBridge(QtCore.QObject):
@@ -1486,6 +2234,7 @@ if PYQT5_AVAILABLE:
 
             global_point, source = self._point_from_signal(x, y)
             raw_hit, hit_widget, cursor_overlay_bypassed = self._widget_at_gaze(app, global_point)
+            hit_widget = self._drop_transparent_hit(hit_widget, global_point)
             target = self._resolve_click_target(hit_widget)
 
             mode = "unresolved"
@@ -1563,6 +2312,15 @@ if PYQT5_AVAILABLE:
                     w.raise_()
                 if timer_stopped and overlay is not None:
                     overlay.timer.start(10)
+
+        def _drop_transparent_hit(self, widget, global_point):
+            """Ignore hits on an overlay window's clear margin so the OS click falls through."""
+            if widget is None:
+                return None
+            accepts = getattr(widget.window(), "accepts_gaze_point", None)
+            if callable(accepts) and not accepts(global_point):
+                return None
+            return widget
 
         def _resolve_click_target(self, widget):
             if widget is None:
@@ -1720,6 +2478,8 @@ def launch_overlay():
     global gaze_click_bridge, cursor_overlay_widget, blink_debug_overlay_widget
     global keyboard_panel_widget, mini_camera_widget
     global notification_overlay_widget, notification_bridge
+    global floating_bar_widget, overlay_panel_widgets
+    global calibration_overlay_widget, calibration_bridge
 
     if not PYQT5_AVAILABLE:
         print("ERROR: PyQt5 is required for system-level overlay mode.")
@@ -1756,13 +2516,42 @@ def launch_overlay():
     emergency_panel = EmergencyOverlayPanel()
     control_panel = ControlOverlayPanel()
 
-    floating_bar = FloatingControlBar({
+    overlay_panel_widgets = {
         "keyboard": keyboard_panel,
         "camera": camera_panel,
         "emergency": emergency_panel,
         "control": control_panel,
-    })
+    }
+    floating_bar = FloatingControlBar(overlay_panel_widgets)
+    floating_bar_widget = floating_bar
     floating_bar.show()
+
+    calibration_overlay_widget = HeadCalibrationOverlay()
+    calibration_bridge = CalibrationBridge(calibration_overlay_widget)
+    if _calibration_needed is not None:
+        QtCore.QTimer.singleShot(1500, _maybe_auto_calibrate)
 
     print("[Overlay] Native floating overlay launched (always-on-top, frameless, transparent).")
     qt_app.exec_()
+
+
+AUTO_CALIBRATION_WAIT_S = 60.0
+AUTO_CALIBRATION_POLL_MS = 500
+
+
+def _maybe_auto_calibrate(waited_s=0.0):
+    """First run: start the 5-point calibration once a face is being tracked."""
+    try:
+        if _calibration_needed is None or not _calibration_needed():
+            return
+        if calibration_overlay_widget is None or calibration_overlay_widget.running:
+            return
+        if _pose_provider is not None and _pose_provider() is not None:
+            start_head_calibration()
+            return
+    except Exception as exc:
+        logger.warning("Automatic calibration check failed: %s", exc)
+        return
+    if waited_s < AUTO_CALIBRATION_WAIT_S:
+        next_wait = waited_s + AUTO_CALIBRATION_POLL_MS / 1000.0
+        QtCore.QTimer.singleShot(AUTO_CALIBRATION_POLL_MS, lambda: _maybe_auto_calibrate(next_wait))

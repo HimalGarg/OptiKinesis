@@ -160,7 +160,7 @@
             </div>
 
             <div class="control-block">
-                <label for="control-cursor-scope">Cursor Scope (lower is more sensitive)</label>
+                <label for="control-cursor-scope">Cursor Scope (only used until 5-point calibration is done)</label>
                 <input type="number" id="control-cursor-scope" step="0.05" value="1" max="2" min="0.35">
             </div>
 
@@ -183,7 +183,7 @@
                 <button class="action-btn" onclick="saveControlSettings()">SAVE SETTINGS</button>
                 <button class="action-btn" onclick="sendAction('toggle_overlay')">TOGGLE CURSOR OVERLAY</button>
                 <button class="action-btn" onclick="sendAction('toggle_mouse')">TOGGLE MOUSE CONTROL</button>
-                <button class="action-btn" onclick="sendAction('calibrate')">CALIBRATE CENTER</button>
+                <button class="action-btn" onclick="sendAction('calibrate')">RE-CENTER</button>
                 <button class="action-btn" onclick="sendAction('toggle_pause')">PAUSE / RESUME</button>
             </div>
 
