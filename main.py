@@ -21,6 +21,7 @@ from collections import deque
 
 from blink_detector import DeliberateBlinkDetector
 from head_calibration import HeadCalibration
+from web_assist import TinyFishClient
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -127,6 +128,8 @@ DEFAULT_SETTINGS = {
     "system_paused": False,
     # Saved 5-point head calibration (see head_calibration.py), or None.
     "head_calibration": None,
+    # Text size (px) in the Web panel's clean reader.
+    "reader_font_px": 24,
 }
 
 
@@ -255,6 +258,13 @@ if all(SMTP_CONFIG.values()):
     logger.info("SMTP email integration configured for %s", SMTP_CONFIG["email"])
 else:
     logger.info("SMTP email integration is not configured")
+
+# TinyFish Search/Fetch for the Web panel's answer cards and clean reader.
+WEB_CLIENT = TinyFishClient.from_env()
+logger.info(
+    "TinyFish web features %s",
+    "configured" if WEB_CLIENT is not None else "not configured (set TINYFISH_API_KEY in .env)",
+)
 
 # --- DESKTOP OVERLAY MODULE ---
 import desktop_overlay
@@ -1066,6 +1076,7 @@ def run_application(args):
         calibration_start=begin_head_calibration,
         calibration_finish=finish_head_calibration,
         calibration_needed=needs_head_calibration,
+        web_client=WEB_CLIENT,
     )
     voice_executor.set_reminder_callback(desktop_overlay.dispatch_notification)
 

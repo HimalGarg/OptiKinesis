@@ -16,6 +16,9 @@ This module contains the PyQt5 floating overlay interface:
 import sys
 import time
 import math
+import threading
+import urllib.parse
+import webbrowser
 import numpy as np
 import cv2
 import pyautogui
@@ -27,6 +30,7 @@ except ImportError:
     wintypes = None
 
 from head_calibration import POINT_LABELS, CalibrationSession
+from web_assist import MISSING_KEY_MESSAGE, WebAssistError, capture_browser_url
 
 logger = logging.getLogger("optikinesis.overlay")
 
@@ -70,6 +74,7 @@ _calibration_start = None
 _calibration_finish = None
 _calibration_needed = None
 _calibration_running = False
+_web_client = None  # web_assist.TinyFishClient, or None without an API key
 
 gaze_click_bridge = None
 cursor_overlay_widget = None
@@ -82,17 +87,19 @@ floating_bar_widget = None
 overlay_panel_widgets = {}
 calibration_overlay_widget = None
 calibration_bridge = None
+web_panel_widget = None
 
 
 def configure_overlay(settings=None, action_executor=None, whatsapp_sender=None, 
                       frame_provider=None, voice_executor=None, fatigue_provider=None,
                       shutdown_callback=None, lock_delay=0.5, debug_hud=False,
                       status_provider=None, pose_provider=None, calibration_start=None,
-                      calibration_finish=None, calibration_needed=None):
+                      calibration_finish=None, calibration_needed=None, web_client=None):
     """Configure external callbacks and settings references from main application."""
     global _settings, _action_executor, _whatsapp_sender, _frame_provider, _voice_executor
     global _fatigue_provider, _shutdown_callback, _status_provider, LOCK_DELAY, DEBUG_BLINK_HUD
     global _pose_provider, _calibration_start, _calibration_finish, _calibration_needed
+    global _web_client
     if settings is not None:
         _settings = settings
     if action_executor is not None:
@@ -117,6 +124,8 @@ def configure_overlay(settings=None, action_executor=None, whatsapp_sender=None,
         _calibration_finish = calibration_finish
     if calibration_needed is not None:
         _calibration_needed = calibration_needed
+    if web_client is not None:
+        _web_client = web_client
     LOCK_DELAY = lock_delay
     DEBUG_BLINK_HUD = debug_hud
 
@@ -1364,6 +1373,30 @@ if PYQT5_AVAILABLE:
                 painter.drawLine(point(x1, y), point(x2, y))
             for x, y in ((14, 4), (8, 12), (16, 20)):
                 painter.drawLine(point(x, y - 2), point(x, y + 2))
+        elif name == "globe":
+            painter.drawEllipse(QtCore.QRectF(2, 2, 20, 20))
+            painter.drawEllipse(QtCore.QRectF(7.5, 2, 9, 20))
+            painter.drawLine(point(2, 12), point(22, 12))
+        elif name == "back":
+            painter.drawPolyline(QtGui.QPolygonF([point(14, 5), point(7, 12), point(14, 19)]))
+        elif name == "up":
+            painter.drawPolyline(QtGui.QPolygonF([point(5, 15), point(12, 8), point(19, 15)]))
+        elif name == "down":
+            painter.drawPolyline(QtGui.QPolygonF([point(5, 9), point(12, 16), point(19, 9)]))
+        elif name == "external":
+            painter.drawPolyline(QtGui.QPolygonF([
+                point(18, 13), point(18, 20), point(4, 20), point(4, 6), point(11, 6),
+            ]))
+            painter.drawLine(point(14, 3), point(21, 3))
+            painter.drawLine(point(21, 3), point(21, 10))
+            painter.drawLine(point(21, 3), point(11, 13))
+        elif name == "page":
+            painter.drawRoundedRect(QtCore.QRectF(5, 2, 14, 20), 2.0, 2.0)
+            for y in (8, 12, 16):
+                painter.drawLine(point(8.5, y), point(15.5, y))
+        elif name == "search":
+            painter.drawEllipse(QtCore.QRectF(3, 3, 13, 13))
+            painter.drawLine(point(14.5, 14.5), point(21, 21))
         painter.restore()
 
 
@@ -1517,7 +1550,23 @@ if PYQT5_AVAILABLE:
         DIVIDER_GAP = 12
         BUTTON_GAP = 6
         BUTTON_OFFSET = PAD + BRAND_W + 2 * DIVIDER_GAP + 1
-        EXPANDED_W = BUTTON_OFFSET + 5 * PillButton.WIDTH + 4 * BUTTON_GAP + PAD
+
+        # (panel key, icon, label, is_danger); "voice" opens the voice prompt,
+        # every other key toggles the overlay panel with that name.
+        BUTTON_SPECS = (
+            ("voice", "mic", "Voice", False),
+            ("keyboard", "keyboard", "Keyboard", False),
+            ("camera", "camera", "Camera", False),
+            ("web", "globe", "Web", False),
+            ("emergency", "alert", "SOS", True),
+            ("control", "sliders", "Settings", False),
+        )
+        EXPANDED_W = (
+            BUTTON_OFFSET
+            + len(BUTTON_SPECS) * PillButton.WIDTH
+            + (len(BUTTON_SPECS) - 1) * BUTTON_GAP
+            + PAD
+        )
 
         SHADOW_X = 18
         SHADOW_TOP = 8
@@ -1531,14 +1580,6 @@ if PYQT5_AVAILABLE:
         HOVER_SLOP = 10
         POLL_MS = 40
         MESSAGE_MS = 4500
-
-        BUTTON_SPECS = (
-            ("voice", "mic", "Voice", False),
-            ("keyboard", "keyboard", "Keyboard", False),
-            ("camera", "camera", "Camera", False),
-            ("emergency", "alert", "SOS", True),
-            ("control", "sliders", "Settings", False),
-        )
 
         def __init__(self, panels):
             window_w = self.EXPANDED_W + 2 * self.SHADOW_X
@@ -1573,7 +1614,9 @@ if PYQT5_AVAILABLE:
                 button.hide()
                 self.buttons[key] = button
             self.buttons["voice"].clicked.connect(self.toggle_voice)
-            for key in ("keyboard", "camera", "emergency", "control"):
+            for key in self.buttons:
+                if key == "voice":
+                    continue
                 self.buttons[key].clicked.connect(
                     lambda _checked=False, name=key: self.toggle_panel(name)
                 )
@@ -2207,6 +2250,634 @@ if PYQT5_AVAILABLE:
             painter.drawEllipse(point, 3.0, 3.0)
 
 
+    # ─── WEB PANEL: ANSWER CARDS + CLEAN READER (TinyFish) ───────────────
+
+    WEB_TEXT_SOFT = QtGui.QColor(203, 213, 225)
+    WEB_AMBER = QtGui.QColor(251, 191, 36)
+    READER_FONT_MIN = 18
+    READER_FONT_MAX = 40
+    READER_FONT_STEP = 3
+
+    def _wrap_text_lines(text, metrics, width, max_lines):
+        """Greedy word wrap into at most max_lines; elides when text is cut off."""
+        words = (text or "").split()
+        lines = []
+        current = ""
+        index = 0
+        while index < len(words):
+            candidate = f"{current} {words[index]}" if current else words[index]
+            if metrics.horizontalAdvance(candidate) <= width or not current:
+                current = candidate
+                index += 1
+            else:
+                lines.append(current)
+                current = ""
+                if len(lines) == max_lines:
+                    break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+        if not lines:
+            return []
+        if index < len(words):
+            lines[-1] = " ".join([lines[-1]] + words[index:])
+        return [metrics.elidedText(line, QtCore.Qt.ElideRight, int(width)) for line in lines]
+
+
+    class _FlashMixin:
+        """Hover tracking and a short glow after each press (blink feedback)."""
+
+        def _init_feedback(self):
+            self._hovered = False
+            self._flash_level = 0.0
+            self._flash_anim = QtCore.QVariantAnimation(self)
+            self._flash_anim.setDuration(480)
+            self._flash_anim.setStartValue(1.0)
+            self._flash_anim.setEndValue(0.0)
+            self._flash_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            self._flash_anim.valueChanged.connect(self._on_flash)
+            self.clicked.connect(lambda _checked=False: self._flash_anim.start())
+
+        def _on_flash(self, value):
+            self._flash_level = float(value)
+            self.update()
+
+        def enterEvent(self, event):
+            self._hovered = True
+            self.update()
+            super().enterEvent(event)
+
+        def leaveEvent(self, event):
+            self._hovered = False
+            self.update()
+            super().leaveEvent(event)
+
+        def _paint_card(self, painter, rect, radius, tone):
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(255, 255, 255, 26 if self._hovered else 13))
+            painter.drawRoundedRect(rect, radius, radius)
+            if self._flash_level > 0.0:
+                painter.setBrush(_with_alpha(tone, 130 * self._flash_level))
+                painter.drawRoundedRect(rect, radius, radius)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            if self._hovered:
+                painter.setPen(QtGui.QPen(_with_alpha(tone, 170), 1.6))
+            else:
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 30), 1.0))
+            painter.drawRoundedRect(rect, radius, radius)
+
+
+    class WebButton(_FlashMixin, QtWidgets.QAbstractButton):
+        """Large painted button: icon + title (+ optional description line)."""
+
+        def __init__(self, icon_name, label, description="", parent=None, min_height=72):
+            super().__init__(parent)
+            self.icon_name = icon_name
+            self.description = description
+            self.setText(label)
+            self.setAccessibleName(label)
+            self.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.setMinimumHeight(min_height)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            self._title_font = _pill_font(30 if description else 16, QtGui.QFont.DemiBold)
+            self._desc_font = _pill_font(19)
+            self._init_feedback()
+
+        def sizeHint(self):
+            return QtCore.QSize(160, self.minimumHeight())
+
+        def paintEvent(self, event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+            if not self.isEnabled():
+                painter.setOpacity(0.35)
+            rect = QtCore.QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+            self._paint_card(painter, rect, 18.0, PILL_ACCENT)
+            icon_color = PILL_ACCENT if self._hovered else PILL_ICON
+
+            if self.description:
+                icon_rect = QtCore.QRectF(40, rect.center().y() - 30, 60, 60)
+                if self.icon_name:
+                    _draw_pill_icon(painter, self.icon_name, icon_rect, icon_color)
+                text_left = 132.0
+                width = rect.width() - text_left - 24
+                painter.setFont(self._title_font)
+                painter.setPen(PILL_TEXT)
+                title_h = QtGui.QFontMetricsF(self._title_font).height()
+                desc_metrics = QtGui.QFontMetrics(self._desc_font)
+                lines = _wrap_text_lines(self.description, desc_metrics, width, 2)
+                block = title_h + 10 + len(lines) * desc_metrics.height()
+                top = rect.center().y() - block / 2
+                painter.drawText(QtCore.QRectF(text_left, top, width, title_h),
+                                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, self.text())
+                painter.setFont(self._desc_font)
+                painter.setPen(WEB_TEXT_SOFT)
+                y = top + title_h + 10
+                for line in lines:
+                    painter.drawText(QtCore.QRectF(text_left, y, width, desc_metrics.height()),
+                                     QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, line)
+                    y += desc_metrics.height()
+            elif self.icon_name:
+                icon_rect = QtCore.QRectF(rect.center().x() - 13, rect.center().y() - 24, 26, 26)
+                _draw_pill_icon(painter, self.icon_name, icon_rect, icon_color)
+                painter.setFont(self._title_font)
+                painter.setPen(PILL_TEXT)
+                painter.drawText(QtCore.QRectF(rect.left(), rect.center().y() + 6, rect.width(), 24),
+                                 QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter, self.text())
+            else:
+                font = _pill_font(24, QtGui.QFont.DemiBold)
+                painter.setFont(font)
+                painter.setPen(PILL_TEXT)
+                painter.drawText(rect, QtCore.Qt.AlignCenter, self.text())
+            painter.end()
+
+
+    class AnswerCard(_FlashMixin, QtWidgets.QAbstractButton):
+        """One search result as a large card; a blink on it opens the page in the reader."""
+
+        def __init__(self, result, parent=None):
+            super().__init__(parent)
+            self.result = result
+            self.setText(result.title)
+            self.setAccessibleName(result.title)
+            self.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.setMinimumHeight(150)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            self._title_font = _pill_font(19, QtGui.QFont.DemiBold)
+            self._site_font = _pill_font(14, QtGui.QFont.DemiBold)
+            self._snippet_font = _pill_font(15)
+            self._init_feedback()
+
+        def paintEvent(self, event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+            rect = QtCore.QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+            self._paint_card(painter, rect, 18.0, PILL_ACCENT)
+
+            left = rect.left() + 22
+            width = rect.width() - 44
+            y = rect.top() + 16
+            site = self.result.site_name + (f"  ·  {self.result.date}" if self.result.date else "")
+            site_metrics = QtGui.QFontMetrics(self._site_font)
+            painter.setFont(self._site_font)
+            painter.setPen(PILL_ACCENT)
+            painter.drawText(QtCore.QRectF(left, y, width, site_metrics.height()),
+                             QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                             site_metrics.elidedText(site, QtCore.Qt.ElideRight, int(width)))
+            y += site_metrics.height() + 6
+
+            title_metrics = QtGui.QFontMetrics(self._title_font)
+            painter.setFont(self._title_font)
+            painter.setPen(PILL_TEXT)
+            for line in _wrap_text_lines(self.result.title, title_metrics, width, 2):
+                painter.drawText(QtCore.QRectF(left, y, width, title_metrics.height()),
+                                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, line)
+                y += title_metrics.height()
+            y += 6
+
+            snippet_metrics = QtGui.QFontMetrics(self._snippet_font)
+            room = int((rect.bottom() - 12 - y) // snippet_metrics.height())
+            if room > 0 and self.result.snippet:
+                painter.setFont(self._snippet_font)
+                painter.setPen(WEB_TEXT_SOFT)
+                for line in _wrap_text_lines(self.result.snippet, snippet_metrics, width, min(3, room)):
+                    painter.drawText(QtCore.QRectF(left, y, width, snippet_metrics.height()),
+                                     QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, line)
+                    y += snippet_metrics.height()
+            painter.end()
+
+
+    class WebTaskBridge(QtCore.QObject):
+        """Delivers background web results to the Qt thread."""
+
+        done = QtCore.pyqtSignal(int, str, object, object)
+        answers_requested = QtCore.pyqtSignal(str)
+        read_page_requested = QtCore.pyqtSignal()
+
+
+    class WebPanel(OverlayPanelBase):
+        """Answer cards and a large-print clean reader, powered by TinyFish."""
+
+        def __init__(self):
+            super().__init__("WEB MODULE", width=min(1280, int(SCREEN_W * 0.8)),
+                             height=min(880, int(SCREEN_H * 0.84)))
+            self._token = 0
+            self._return_page = None
+            self._reader_return_page = None
+            self._last_query = ""
+            self._article = None
+            self._cards = []
+
+            self.bridge = WebTaskBridge()
+            self.bridge.done.connect(self._on_task_done, QtCore.Qt.QueuedConnection)
+            self.bridge.answers_requested.connect(self.find_answers, QtCore.Qt.QueuedConnection)
+            self.bridge.read_page_requested.connect(self.read_current_page, QtCore.Qt.QueuedConnection)
+
+            self.stack = QtWidgets.QStackedWidget(self.body)
+            self.body_layout.addWidget(self.stack, 1)
+            self.status = QtWidgets.QLabel("", self.body)
+            self.status.setWordWrap(True)
+            self.status.setStyleSheet("font-size: 17px; padding: 2px 6px;")
+            self.body_layout.addWidget(self.status)
+
+            self.home_page = self._build_home()
+            self.busy_page = self._build_busy()
+            self.answers_page = self._build_answers()
+            self.reader_page = self._build_reader()
+            for page in (self.home_page, self.busy_page, self.answers_page, self.reader_page):
+                self.stack.addWidget(page)
+            self._show_home()
+
+        # ─── pages ───────────────────────────────────────────────────────
+
+        def _build_home(self):
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(16, 16, 16, 8)
+            layout.setSpacing(18)
+            read_btn = WebButton(
+                "page", "Read this page",
+                "Shows the page open in your browser as large, clean text without ads or pop-ups.",
+                min_height=150,
+            )
+            read_btn.clicked.connect(self.read_current_page)
+            find_btn = WebButton(
+                "search", "Find answers",
+                "Type or say a question and see the best results as big cards.",
+                min_height=150,
+            )
+            find_btn.clicked.connect(lambda _checked=False: self.find_answers(None))
+            layout.addWidget(read_btn, 1)
+            layout.addWidget(find_btn, 1)
+            self.home_note = QtWidgets.QLabel("", page)
+            self.home_note.setWordWrap(True)
+            self.home_note.setStyleSheet("font-size: 15px; color: #94a0b2; padding: 4px;")
+            layout.addWidget(self.home_note)
+            return page
+
+        def _build_busy(self):
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.addStretch(1)
+            self.busy_label = QtWidgets.QLabel("", page)
+            self.busy_label.setAlignment(QtCore.Qt.AlignCenter)
+            self.busy_label.setWordWrap(True)
+            self.busy_label.setStyleSheet("font-size: 26px; font-weight: 600; color: #f1f5f9;")
+            layout.addWidget(self.busy_label)
+            self._busy_dots = 0
+            self._busy_text = ""
+            self._busy_timer = QtCore.QTimer(self)
+            self._busy_timer.timeout.connect(self._tick_busy)
+            row = QtWidgets.QHBoxLayout()
+            row.addStretch(1)
+            cancel = WebButton("back", "Cancel", min_height=76)
+            cancel.setFixedWidth(200)
+            cancel.clicked.connect(self._cancel_task)
+            row.addWidget(cancel)
+            row.addStretch(1)
+            layout.addSpacing(24)
+            layout.addLayout(row)
+            layout.addStretch(1)
+            return page
+
+        def _build_answers(self):
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(8, 8, 8, 0)
+            layout.setSpacing(12)
+            top = QtWidgets.QHBoxLayout()
+            back = WebButton("back", "Back", min_height=76)
+            back.setFixedWidth(150)
+            back.clicked.connect(self._show_home)
+            top.addWidget(back)
+            self.answers_title = QtWidgets.QLabel("", page)
+            self.answers_title.setStyleSheet("font-size: 22px; font-weight: 600; color: #f1f5f9; padding-left: 10px;")
+            top.addWidget(self.answers_title, 1)
+            google = WebButton("external", "Open in Google", min_height=76)
+            google.setFixedWidth(210)
+            google.clicked.connect(self._open_query_in_google)
+            top.addWidget(google)
+            layout.addLayout(top)
+            self.cards_grid = QtWidgets.QGridLayout()
+            self.cards_grid.setSpacing(14)
+            layout.addLayout(self.cards_grid, 1)
+            return page
+
+        def _build_reader(self):
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(8, 8, 8, 0)
+            layout.setSpacing(10)
+            top = QtWidgets.QHBoxLayout()
+            back = WebButton("back", "Back", min_height=76)
+            back.setFixedWidth(150)
+            back.clicked.connect(self._reader_back)
+            top.addWidget(back)
+            heading = QtWidgets.QVBoxLayout()
+            self.reader_title = QtWidgets.QLabel("", page)
+            self.reader_title.setStyleSheet("font-size: 22px; font-weight: 600; color: #f1f5f9; padding-left: 10px;")
+            self.reader_meta = QtWidgets.QLabel("", page)
+            self.reader_meta.setStyleSheet("font-size: 15px; color: #38bdf8; padding-left: 10px;")
+            heading.addWidget(self.reader_title)
+            heading.addWidget(self.reader_meta)
+            top.addLayout(heading, 1)
+            layout.addLayout(top)
+
+            main = QtWidgets.QHBoxLayout()
+            main.setSpacing(12)
+            self.reader_text = QtWidgets.QTextBrowser(page)
+            self.reader_text.setOpenLinks(False)
+            self.reader_text.setOpenExternalLinks(False)
+            self.reader_text.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.reader_text.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self.reader_text.setStyleSheet("""
+                QTextBrowser {
+                    background: rgba(9, 13, 21, 245);
+                    color: #e6edf5;
+                    border: 1px solid #253a52;
+                    border-radius: 14px;
+                }
+                QScrollBar:vertical { width: 14px; background: transparent; margin: 8px 2px; }
+                QScrollBar::handle:vertical { background: #2f4b69; border-radius: 6px; min-height: 40px; }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+            """)
+            main.addWidget(self.reader_text, 1)
+
+            side = QtWidgets.QVBoxLayout()
+            side.setSpacing(10)
+            self.up_btn = WebButton("up", "Up", min_height=90)
+            self.up_btn.clicked.connect(lambda _checked=False: self._scroll_reader(-1))
+            self.down_btn = WebButton("down", "Down", min_height=90)
+            self.down_btn.clicked.connect(lambda _checked=False: self._scroll_reader(1))
+            bigger = WebButton("", "A+", min_height=70)
+            bigger.clicked.connect(lambda _checked=False: self._change_font(READER_FONT_STEP))
+            smaller = WebButton("", "A−", min_height=70)
+            smaller.clicked.connect(lambda _checked=False: self._change_font(-READER_FONT_STEP))
+            browser = WebButton("external", "Browser", min_height=90)
+            browser.clicked.connect(self._open_article_in_browser)
+            for widget, stretch in ((self.up_btn, 3), (self.down_btn, 3), (bigger, 2),
+                                    (smaller, 2), (browser, 2)):
+                widget.setFixedWidth(150)
+                side.addWidget(widget, stretch)
+            main.addLayout(side)
+            layout.addLayout(main, 1)
+
+            bar = self.reader_text.verticalScrollBar()
+            self._scroll_anim = QtCore.QPropertyAnimation(bar, b"value", self)
+            self._scroll_anim.setDuration(280)
+            self._scroll_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            bar.valueChanged.connect(self._update_scroll_buttons)
+            bar.rangeChanged.connect(lambda *_args: self._update_scroll_buttons())
+            return page
+
+        # ─── navigation ──────────────────────────────────────────────────
+
+        def _set_status(self, text, warning=False):
+            color = "#fbbf24" if warning else "#9fb6cf"
+            self.status.setStyleSheet(f"font-size: 17px; padding: 2px 6px; color: {color};")
+            self.status.setText(text)
+
+        def _show_home(self):
+            self._token += 1  # drop any late result
+            self._busy_timer.stop()
+            if _web_client is None:
+                self.home_note.setStyleSheet("font-size: 15px; color: #fbbf24; padding: 4px;")
+                self.home_note.setText(MISSING_KEY_MESSAGE)
+            else:
+                self.home_note.setStyleSheet("font-size: 15px; color: #94a0b2; padding: 4px;")
+                self.home_note.setText("Searches and pages are loaded through TinyFish.")
+            self.stack.setCurrentWidget(self.home_page)
+
+        def open(self):
+            """Show this panel on its own, like the pill buttons do."""
+            for panel in overlay_panel_widgets.values():
+                if panel is not self:
+                    panel.hide()
+            self.show()
+            self.raise_()
+
+        def _reader_back(self):
+            if self._reader_return_page is self.answers_page and self._cards:
+                self.stack.setCurrentWidget(self.answers_page)
+            else:
+                self._show_home()
+
+        def _cancel_task(self):
+            self._token += 1
+            self._busy_timer.stop()
+            self.stack.setCurrentWidget(self._return_page or self.home_page)
+            self._set_status("Cancelled.")
+
+        def _tick_busy(self):
+            self._busy_dots = (self._busy_dots + 1) % 4
+            self.busy_label.setText(self._busy_text + "." * self._busy_dots)
+
+        # ─── background tasks ────────────────────────────────────────────
+
+        def _run(self, kind, busy_text, func):
+            self._token += 1
+            token = self._token
+            current = self.stack.currentWidget()
+            self._return_page = current if current is not self.busy_page else self.home_page
+            self._busy_text = busy_text
+            self._busy_dots = 0
+            self.busy_label.setText(busy_text)
+            self._busy_timer.start(450)
+            self._set_status("")
+            self.stack.setCurrentWidget(self.busy_page)
+            bridge = self.bridge
+
+            def worker():
+                result, error = None, None
+                try:
+                    result = func()
+                except WebAssistError as exc:
+                    error = exc.message
+                except Exception:
+                    logger.exception("Web task %s failed", kind)
+                    error = "Something went wrong. Please try again."
+                bridge.done.emit(token, kind, result, error)
+
+            threading.Thread(target=worker, name=f"web-{kind}", daemon=True).start()
+
+        def _on_task_done(self, token, kind, result, error):
+            if token != self._token:
+                return  # cancelled or superseded
+            self._busy_timer.stop()
+            try:
+                if error:
+                    self.stack.setCurrentWidget(self._return_page or self.home_page)
+                    self._set_status(error, warning=True)
+                elif kind == "search":
+                    self._show_answers(result)
+                elif kind == "read":
+                    self._show_article(result)
+            except Exception:
+                logger.exception("Showing web result failed")
+                self.stack.setCurrentWidget(self.home_page)
+                self._set_status("Something went wrong showing that result.", warning=True)
+
+        # ─── answer cards ────────────────────────────────────────────────
+
+        def find_answers(self, query=None):
+            self.open()
+            if _web_client is None:
+                self._show_home()
+                self._set_status(MISSING_KEY_MESSAGE, warning=True)
+                return
+            if not query:
+                query = self._ask_query()
+                if not query:
+                    return
+            self._last_query = query.strip()
+            client = _web_client
+            self._run("search", f"Finding answers for “{self._last_query}”",
+                      lambda: client.search(self._last_query))
+
+        def _ask_query(self):
+            dialog = QtWidgets.QInputDialog()
+            dialog.setWindowTitle("Find answers")
+            dialog.setLabelText("What would you like to find?")
+            dialog.setTextValue(self._last_query)
+            dialog.setWindowFlags(dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+            dialog.setStyleSheet(
+                "QLabel, QLineEdit, QPushButton { font-size: 18px; }"
+                "QLineEdit { min-width: 560px; min-height: 42px; }"
+                "QPushButton { min-height: 40px; min-width: 110px; }"
+            )
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return None
+            return dialog.textValue().strip() or None
+
+        def _show_answers(self, answers):
+            for card in self._cards:
+                self.cards_grid.removeWidget(card)
+                card.deleteLater()
+            self._cards = []
+            self.answers_title.setText(f"Answers for “{answers.query}”")
+            if not answers.results:
+                self.stack.setCurrentWidget(self.home_page)
+                self._set_status("No results found. Try different words.", warning=True)
+                return
+            for index, result in enumerate(answers.results):
+                card = AnswerCard(result)
+                card.clicked.connect(lambda _checked=False, r=result: self.read_url(r.url))
+                self.cards_grid.addWidget(card, index // 2, index % 2)
+                self._cards.append(card)
+            self.stack.setCurrentWidget(self.answers_page)
+            self._set_status("Look at a card and blink to read it.")
+
+        def _open_query_in_google(self):
+            if self._last_query:
+                webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote(self._last_query))
+
+        # ─── clean reader ────────────────────────────────────────────────
+
+        def read_current_page(self):
+            self.open()
+            if _web_client is None:
+                self._show_home()
+                self._set_status(MISSING_KEY_MESSAGE, warning=True)
+                return
+            client = _web_client
+            self._reader_return_page = self.home_page
+
+            def task():
+                time.sleep(0.3)  # let focus return to the browser after any dialog
+                return client.fetch(capture_browser_url())
+
+            self._run("read", "Opening the page in the reader", task)
+
+        def read_url(self, url):
+            if _web_client is None:
+                return
+            client = _web_client
+            self._reader_return_page = self.stack.currentWidget()
+            self._run("read", "Opening the page in the reader", lambda: client.fetch(url))
+
+        def _show_article(self, article):
+            self._article = article
+            metrics = QtGui.QFontMetrics(_pill_font(22, QtGui.QFont.DemiBold))
+            self.reader_title.setText(metrics.elidedText(article.title, QtCore.Qt.ElideRight, 820))
+            self.reader_meta.setText(f"{article.site_name}  ·  {article.reading_minutes} min read")
+            self.reader_text.setMarkdown(article.text)
+            self._apply_reader_format()
+            self.reader_text.verticalScrollBar().setValue(0)
+            self.stack.setCurrentWidget(self.reader_page)
+            self._update_scroll_buttons()
+            self._set_status("Use Up and Down to read. A+ and A− change the text size.")
+
+        def _reader_font_px(self):
+            try:
+                size = int(_settings.get("reader_font_px", 24))
+            except (TypeError, ValueError):
+                size = 24
+            return max(READER_FONT_MIN, min(READER_FONT_MAX, size))
+
+        def _apply_reader_format(self):
+            size = self._reader_font_px()
+            document = self.reader_text.document()
+            font = QtGui.QFont(PILL_FONT_FAMILY)
+            font.setPixelSize(size)
+            document.setDefaultFont(font)
+            document.setDocumentMargin(36)
+            cursor = QtGui.QTextCursor(document)
+            cursor.select(QtGui.QTextCursor.Document)
+            block = QtGui.QTextBlockFormat()
+            block.setLineHeight(150, QtGui.QTextBlockFormat.ProportionalHeight)
+            block.setBottomMargin(size * 0.6)
+            cursor.mergeBlockFormat(block)
+
+        def _change_font(self, delta):
+            size = max(READER_FONT_MIN, min(READER_FONT_MAX, self._reader_font_px() + delta))
+            _settings["reader_font_px"] = size
+            _perform_action("save_settings")
+            bar = self.reader_text.verticalScrollBar()
+            fraction = bar.value() / bar.maximum() if bar.maximum() else 0.0
+            self._apply_reader_format()
+            bar.setValue(int(fraction * bar.maximum()))
+            self._set_status(f"Text size {size}.")
+
+        def _scroll_reader(self, direction):
+            bar = self.reader_text.verticalScrollBar()
+            step = int(self.reader_text.viewport().height() * 0.85)
+            start = bar.value()
+            if self._scroll_anim.state() == QtCore.QAbstractAnimation.Running:
+                start = int(self._scroll_anim.endValue())
+                self._scroll_anim.stop()
+            target = max(bar.minimum(), min(bar.maximum(), start + direction * step))
+            self._scroll_anim.setStartValue(bar.value())
+            self._scroll_anim.setEndValue(target)
+            self._scroll_anim.start()
+
+        def _update_scroll_buttons(self, *_args):
+            bar = self.reader_text.verticalScrollBar()
+            self.up_btn.setEnabled(bar.value() > bar.minimum())
+            self.down_btn.setEnabled(bar.value() < bar.maximum())
+
+        def _open_article_in_browser(self):
+            if self._article is not None:
+                webbrowser.open(self._article.final_url)
+
+
+    def request_answers(query):
+        """Voice hook: show answer cards for a query. False means fall back to Google."""
+        if web_panel_widget is None or _web_client is None:
+            return False
+        web_panel_widget.bridge.answers_requested.emit(str(query))
+        return True
+
+
+    def request_read_page():
+        """Voice hook: open the browser's current page in the reader."""
+        if web_panel_widget is None or _web_client is None:
+            return False
+        web_panel_widget.bridge.read_page_requested.emit()
+        return True
+
+
     class GazeClickBridge(QtCore.QObject):
         """Dispatch blink clicks to the widget under gaze in the Qt main thread."""
 
@@ -2479,7 +3150,7 @@ def launch_overlay():
     global keyboard_panel_widget, mini_camera_widget
     global notification_overlay_widget, notification_bridge
     global floating_bar_widget, overlay_panel_widgets
-    global calibration_overlay_widget, calibration_bridge
+    global calibration_overlay_widget, calibration_bridge, web_panel_widget
 
     if not PYQT5_AVAILABLE:
         print("ERROR: PyQt5 is required for system-level overlay mode.")
@@ -2515,13 +3186,18 @@ def launch_overlay():
     camera_panel = CameraOverlayPanel()
     emergency_panel = EmergencyOverlayPanel()
     control_panel = ControlOverlayPanel()
+    web_panel_widget = WebPanel()
 
     overlay_panel_widgets = {
         "keyboard": keyboard_panel,
         "camera": camera_panel,
+        "web": web_panel_widget,
         "emergency": emergency_panel,
         "control": control_panel,
     }
+    if _voice_executor is not None:
+        # Spoken searches show answer cards; "read this page" opens the reader.
+        _voice_executor.set_web_handlers(search=request_answers, read_page=request_read_page)
     floating_bar = FloatingControlBar(overlay_panel_widgets)
     floating_bar_widget = floating_bar
     floating_bar.show()

@@ -42,6 +42,7 @@ class ActionType(Enum):
     SEND_EMAIL = "send_email"
     SET_ALARM = "set_alarm"
     SET_REMINDER = "set_reminder"
+    READ_PAGE = "read_page"
     UNKNOWN = "unknown"
 
 
@@ -74,6 +75,13 @@ class VoiceCommandParser:
     
     # Regex patterns for intent detection (case-insensitive)
     PATTERNS = [
+        # Reader: "read this page" opens the browser's current page in the clean reader
+        (
+            r"^\s*read\s+(?:this|the|current|my)\s+(?:web\s*)?page\b",
+            ActionType.READ_PAGE,
+            [],
+            False
+        ),
         # Email: "send email to X, subject Y, content Z" or variations
         (
             r"send\s+(?:an?\s+)?email\s+to\s+([^\s,]+@[^\s,]+)[\s,]+subject\s+(.+?)[\s,]+(?:content|message|body)\s+(.+)",
@@ -131,6 +139,20 @@ class VoiceCommandParser:
         (
             r"(?:play|watch|find)\s+(.+)\s+on\s+youtube",
             ActionType.SEARCH_YOUTUBE,
+            ['query'],
+            False
+        ),
+        # General searches: "find X", "look up X", or a plain question.
+        # Kept last so the more specific patterns above win.
+        (
+            r"^\s*(?:look\s+up|find)\s+(.+)",
+            ActionType.SEARCH_GOOGLE,
+            ['query'],
+            False
+        ),
+        (
+            r"^\s*((?:what|who|where|when|why|how)\b.+)",
+            ActionType.SEARCH_GOOGLE,
             ['query'],
             False
         ),
@@ -362,6 +384,12 @@ class VoiceCommandExecutor:
         
         # Confirmation timeout (seconds)
         self.confirmation_timeout = 30
+
+        # Optional overlay hooks for answer cards and the clean reader.  Each
+        # returns True when it handled the request; otherwise searches fall
+        # back to opening Google in the browser.
+        self.search_handler: Optional[Callable[[str], bool]] = None
+        self.read_page_handler: Optional[Callable[[], bool]] = None
     
     def configure_email(self, config: Dict[str, str]) -> None:
         """Configure email SMTP settings."""
@@ -370,6 +398,15 @@ class VoiceCommandExecutor:
     def set_reminder_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for when reminders trigger."""
         self.reminder_scheduler.set_callback(callback)
+
+    def set_web_handlers(
+        self,
+        search: Optional[Callable[[str], bool]] = None,
+        read_page: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Route searches to answer cards and "read this page" to the reader."""
+        self.search_handler = search
+        self.read_page_handler = read_page
     
     def process_command(self, text: str) -> Dict[str, Any]:
         """
@@ -490,6 +527,8 @@ class VoiceCommandExecutor:
         try:
             if intent.action_type == ActionType.SEARCH_GOOGLE:
                 query = params.get('query', '')
+                if self.search_handler is not None and self.search_handler(query):
+                    return {'status': 'success', 'message': f'Showing answers for: {query}'}
                 url = f"https://www.google.com/search?q={urllib.parse.quote(query)}"
                 webbrowser.open(url)
                 return {'status': 'success', 'message': f'Searching Google for: {query}'}
@@ -500,6 +539,14 @@ class VoiceCommandExecutor:
                 webbrowser.open(url)
                 return {'status': 'success', 'message': f'Searching YouTube for: {query}'}
             
+            elif intent.action_type == ActionType.READ_PAGE:
+                if self.read_page_handler is not None and self.read_page_handler():
+                    return {'status': 'success', 'message': 'Opening this page in the reader'}
+                return {
+                    'status': 'error',
+                    'message': 'The reader needs the desktop overlay and a TinyFish API key.',
+                }
+
             elif intent.action_type == ActionType.SEND_EMAIL:
                 recipient = params.get('recipient', '')
                 subject = params.get('subject', 'No Subject')

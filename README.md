@@ -130,6 +130,7 @@ All interaction happens through a floating desktop overlay (PyQt5) that sits on 
 | **🚨 Emergency** | One-tap SOS actions: WhatsApp message to a saved emergency contact, automated phone call via Twilio, or direct dial to emergency services (100 police / 112 ambulance in India). |
 | **⚙ Control** | Adjustable settings for cursor speed, blink sensitivity, and lock delay — so caregivers can tune the system to each user's ability. |
 | **🎤 Voice** | Native mode accepts command text with confirmation dialogs. Optional web mode adds browser-provided speech recognition. |
+| **🌐 Web** | **Find answers** shows the top search results as large cards; one blink opens a result. **Read this page** turns the page open in the browser into large, clean text with no ads or pop-ups, with big Up/Down and text-size buttons. Powered by the free TinyFish Search and Fetch APIs (needs `TINYFISH_API_KEY`). Voice searches and "read this page" use it too. |
 
 ---
 
@@ -325,6 +326,7 @@ OptiKinesis/
 ├── head_calibration.py      # 5-point head calibration: capture logic and personal cursor map
 ├── desktop_overlay.py       # PyQt5 overlay UI — all panels, keyboard, control bar, gaze bridge
 ├── voice_commands.py         # Voice command NLP parsing and task automation
+├── web_assist.py             # TinyFish Search/Fetch client for answer cards and the clean reader
 ├── fatigue_monitor.py        # Rolling-window blink-rate analyzer for fatigue detection
 ├── eye_blink.py              # Standalone blink detection utilities
 ├── preview_overlay.py        # Live-reload preview tool for iterating on overlay UI
@@ -377,7 +379,7 @@ python main.py --web
 
 The web server binds to `127.0.0.1` by default. Use `python main.py --help` for host, port, and browser-launch options.
 
-Optional Twilio and SMTP integrations can be configured by copying `.env.example` to `.env` and filling only the credentials you need. User accessibility settings are saved locally in `settings.json`.
+Optional Twilio, SMTP and TinyFish integrations can be configured by copying `.env.example` to `.env` and filling only the credentials you need. Without `TINYFISH_API_KEY`, the Web panel explains how to enable it and voice searches open Google as before. User accessibility settings are saved locally in `settings.json`.
 
 ### Tests
 

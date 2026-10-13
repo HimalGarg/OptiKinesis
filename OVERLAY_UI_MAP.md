@@ -127,6 +127,27 @@ ring are hidden while it runs and restored afterwards.
 
 ---
 
+## 🌐 Web Panel — `WebPanel` (answer cards + clean reader)
+
+Opened by the pill's **Web** button, by voice searches, and by "read this
+page". Three views share one panel: home, answer cards, and the reader. A busy
+view with Cancel appears while TinyFish works; errors appear in the status
+line at the bottom. Network calls run on a background thread and come back
+through `WebTaskBridge`.
+
+| What to change | Where |
+|---|---|
+| **Home actions and descriptions** | `_build_home()` |
+| **Card look (fonts, lines shown)** | `AnswerCard.paintEvent()` |
+| **Big button look** | `WebButton` and `_FlashMixin._paint_card()` |
+| **Reader colors, scrollbar** | stylesheet in `_build_reader()` |
+| **Reader text size range** | `READER_FONT_MIN/MAX/STEP`; saved as `reader_font_px` in settings |
+| **Line spacing, margins** | `_apply_reader_format()` |
+| **Scroll distance and speed** | `_scroll_reader()` (85% of a screen) and `_scroll_anim` duration |
+| **Number of answers, API timeouts** | `MAX_ANSWERS` and timeouts in `web_assist.py` |
+
+---
+
 ## ⌨ Keyboard Panel — `KeyboardOverlayPanel` (Lines 304–624)
 
 ### Window Size (Lines 307–315)

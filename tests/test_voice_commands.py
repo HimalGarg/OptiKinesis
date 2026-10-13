@@ -35,6 +35,46 @@ class VoiceCommandTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         schedule.assert_called_once_with("7 AM")
 
+    def test_questions_and_find_phrases_are_searches(self):
+        parser = VoiceCommandParser()
+        cases = {
+            "What is ALS": "What is ALS",
+            "find wheelchair ramps near me": "wheelchair ramps near me",
+            "look up physiotherapy exercises": "physiotherapy exercises",
+        }
+        for spoken, query in cases.items():
+            intent = parser.parse(spoken)
+            self.assertEqual(intent.action_type, ActionType.SEARCH_GOOGLE, spoken)
+            self.assertEqual(intent.params["query"], query)
+        self.assertEqual(parser.parse("find relaxing music on youtube").action_type,
+                         ActionType.SEARCH_YOUTUBE)
+
+    def test_search_shows_answer_cards_when_overlay_handles_it(self):
+        executor = VoiceCommandExecutor()
+        seen = []
+        executor.set_web_handlers(search=lambda q: seen.append(q) or True)
+        with mock.patch("voice_commands.webbrowser.open") as browser:
+            result = executor.process_command("search ALS trials on Google")
+        self.assertEqual(seen, ["ALS trials"])
+        self.assertIn("Showing answers", result["message"])
+        browser.assert_not_called()
+
+    def test_search_falls_back_to_google_without_handler(self):
+        executor = VoiceCommandExecutor()
+        with mock.patch("voice_commands.webbrowser.open") as browser:
+            result = executor.process_command("google ALS trials")
+        browser.assert_called_once()
+        self.assertEqual(result["status"], "success")
+
+    def test_read_this_page_uses_reader_handler(self):
+        executor = VoiceCommandExecutor()
+        calls = []
+        executor.set_web_handlers(read_page=lambda: calls.append(1) or True)
+        result = executor.process_command("Read this page")
+        self.assertEqual(calls, [1])
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(VoiceCommandExecutor().process_command("read this page")["status"], "error")
+
     def test_alarm_parser_rejects_unstructured_time(self):
         with self.assertRaises(ValueError):
             ReminderScheduler._parse_alarm_time("sometime tomorrow")
