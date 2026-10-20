@@ -8,6 +8,7 @@ from web_assist import (
     Article,
     TinyFishClient,
     WebAssistError,
+    WindowInfo,
     capture_browser_url,
     clean_markdown,
     normalize_page_url,
@@ -138,6 +139,13 @@ class FetchTests(unittest.TestCase):
         self.assertIn("Read our guide now.", article.text)
         self.assertEqual(article.reading_minutes, 1)
 
+    def test_ip_final_address_keeps_friendly_site_name(self):
+        body = {"results": [{"url": "https://guide.example.edu/als", "final_url": "https://151.101.42.133/als",
+                             "title": "Guide", "text": "Some text here."}], "errors": []}
+        article = TinyFishClient("k", session=FakeSession(FakeResponse(200, body))).fetch(
+            "https://guide.example.edu/als")
+        self.assertEqual(article.site_name, "guide.example.edu")
+
     def test_per_url_errors_map_to_reasons(self):
         body = {"results": [], "errors": [{"url": "https://bank.example", "error": "login_required"}]}
         session = FakeSession(FakeResponse(200, body))
@@ -199,28 +207,63 @@ class FakeKeys:
         self.sent.append(key)
 
 
+OWN_PID = 4242
+OVERLAY = WindowInfo(hwnd=1, pid=OWN_PID, name="python.exe")
+BRAVE = WindowInfo(hwnd=2, pid=100, name="brave.exe")
+WORD = WindowInfo(hwnd=3, pid=200, name="winword.exe")
+
+
 class CaptureBrowserUrlTests(unittest.TestCase):
+    def capture(self, front, clipboard, keys, last_external=None, wait_s=1.2):
+        state = {"front": front, "activated": []}
+
+        def activate(hwnd):
+            state["activated"].append(hwnd)
+            state["front"] = BRAVE if hwnd == BRAVE.hwnd else state["front"]
+            return True
+
+        url = capture_browser_url(
+            foreground=lambda: state["front"], last_external=last_external, activate=activate,
+            clipboard=clipboard, keys=keys, sleep=lambda s: None, wait_s=wait_s, own_pid=OWN_PID,
+        )
+        return url, state["activated"]
+
     def test_copies_address_and_restores_clipboard(self):
         clipboard = FakeClipboard("user's own text", "https://news.example/story#c")
         keys = FakeKeys(clipboard)
-        url = capture_browser_url(lambda: "chrome.exe", clipboard, keys, sleep=lambda s: None)
+        url, activated = self.capture(BRAVE, clipboard, keys)
         self.assertEqual(url, "https://news.example/story")
         self.assertEqual(keys.sent, ["ctrl+l", "ctrl+c", "esc"])
         self.assertEqual(clipboard.value, "user's own text")
+        self.assertEqual(activated, [])
+
+    def test_switches_back_to_browser_when_optikinesis_is_in_front(self):
+        clipboard = FakeClipboard("keep", "https://mail.example/inbox")
+        keys = FakeKeys(clipboard)
+        url, activated = self.capture(OVERLAY, clipboard, keys, last_external=BRAVE)
+        self.assertEqual(activated, [BRAVE.hwnd])
+        self.assertEqual(url, "https://mail.example/inbox")
 
     def test_refuses_when_no_browser_is_in_front(self):
         clipboard = FakeClipboard("keep", "https://x.example")
         keys = FakeKeys(clipboard)
         with self.assertRaises(WebAssistError) as ctx:
-            capture_browser_url(lambda: "winword.exe", clipboard, keys, sleep=lambda s: None)
+            self.capture(WORD, clipboard, keys, last_external=BRAVE)
         self.assertEqual(keys.sent, [])
         self.assertEqual(ctx.exception.code, "no_browser")
+
+    def test_refuses_when_last_app_was_not_a_browser(self):
+        clipboard = FakeClipboard("keep", "https://x.example")
+        keys = FakeKeys(clipboard)
+        with self.assertRaises(WebAssistError):
+            self.capture(OVERLAY, clipboard, keys, last_external=WORD)
+        self.assertEqual(keys.sent, [])
 
     def test_reports_failure_when_nothing_was_copied(self):
         clipboard = FakeClipboard("keep", None)
         keys = FakeKeys(clipboard)
         with self.assertRaises(WebAssistError):
-            capture_browser_url(lambda: "msedge.exe", clipboard, keys, sleep=lambda s: None, wait_s=0.05)
+            self.capture(BRAVE, clipboard, keys, wait_s=0.05)
         self.assertEqual(clipboard.value, "keep")
 
 

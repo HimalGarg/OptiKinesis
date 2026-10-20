@@ -125,12 +125,12 @@ All interaction happens through a floating desktop overlay (PyQt5) that sits on 
 
 | Module | Purpose |
 |---|---|
-| **⌨ Keyboard** | Full QWERTY virtual keyboard with Shift, Caps Lock, and special characters. Typed characters go directly into the active application's text field. |
+| **⌨ Keyboard** | Full QWERTY virtual keyboard with Shift, Caps Lock, and special characters. Typed characters go directly into the active application's text field. A row of **word suggestions** above the keys updates as you type; one blink on a suggestion finishes the word and adds a space. The **Speak** button turns speech into text: press it, talk, and it stops after a short pause (press again to stop early). Uses Google's free speech service, so it needs internet and sends the audio to Google. |
 | **📷 Camera** | Live preview of the webcam feed so the user or caregiver can verify face tracking. A mini camera feed also stays visible in the bottom-right corner at all times. |
 | **🚨 Emergency** | One-tap SOS actions: WhatsApp message to a saved emergency contact, automated phone call via Twilio, or direct dial to emergency services (100 police / 112 ambulance in India). |
 | **⚙ Control** | Adjustable settings for cursor speed, blink sensitivity, and lock delay — so caregivers can tune the system to each user's ability. |
 | **🎤 Voice** | Native mode accepts command text with confirmation dialogs. Optional web mode adds browser-provided speech recognition. |
-| **🌐 Web** | **Find answers** shows the top search results as large cards; one blink opens a result. **Read this page** turns the page open in the browser into large, clean text with no ads or pop-ups, with big Up/Down and text-size buttons. Powered by the free TinyFish Search and Fetch APIs (needs `TINYFISH_API_KEY`). Voice searches and "read this page" use it too. |
+| **🌐 Web** | **Find answers** opens a large question box with the on-screen keyboard below it, then shows the top search results as large cards; one blink opens a result. **Read this page** turns the page open in the browser into large, clean text with no ads or pop-ups, with big Up/Down and text-size buttons. Powered by the free TinyFish Search and Fetch APIs (needs `TINYFISH_API_KEY`). Voice searches and "read this page" use it too. |
 
 ---
 
@@ -327,6 +327,8 @@ OptiKinesis/
 ├── desktop_overlay.py       # PyQt5 overlay UI — all panels, keyboard, control bar, gaze bridge
 ├── voice_commands.py         # Voice command NLP parsing and task automation
 ├── web_assist.py             # TinyFish Search/Fetch client for answer cards and the clean reader
+├── word_suggestions.py       # Word completion for the on-screen keyboard
+├── speech_input.py           # Voice typing for the keyboard's Speak button
 ├── fatigue_monitor.py        # Rolling-window blink-rate analyzer for fatigue detection
 ├── eye_blink.py              # Standalone blink detection utilities
 ├── preview_overlay.py        # Live-reload preview tool for iterating on overlay UI

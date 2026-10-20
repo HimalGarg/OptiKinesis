@@ -3,78 +3,97 @@
 Temporary progress and handoff notes. Update before finishing or handing off.
 Durable knowledge belongs in `PROJECT_CONTEXT.md`.
 
-_Last updated: 2026-10-13 by Claude Code (handoff)._
+_Last updated: 2026-10-20 by Claude Code._
 
 ## Handoff status
 
-- Branch `main`. The Web panel and shared context files were **committed and
-  pushed to `origin/main`** at the user's request on 2026-10-13 (the commit
-  that adds this file; see `git log`).
-- The only change left out was `__pycache__/desktop_overlay.cpython-310.pyc`,
-  a generated file tracked by mistake. It remains modified locally; keep it
-  out of commits.
-- No feature work is in progress mid-edit; the Web panel is code-complete.
+- Branch `main`. Everything below dated 2026-10-20 was **committed and pushed
+  to `origin/main`** at the user's request (the commit after `be484e2`; see
+  `git log`).
+- Working tree:
+  - Modified: `desktop_overlay.py`, `web_assist.py`, `tests/test_web_assist.py`,
+    `README.md`, `OVERLAY_UI_MAP.md`, `AGENTS.md`, `PROJECT_CONTEXT.md`,
+    `TASKS.md`.
+  - New: `word_suggestions.py`, `tests/test_word_suggestions.py`,
+    `speech_input.py`, `tests/test_speech_input.py`. Also modified:
+    `requirements.txt`.
+  - Generated `.pyc` files in `__pycache__` are also modified. Keep them out
+    of commits.
+  - `.env` holds the user's TinyFish key. It is gitignored; never commit it.
 
 ## Current objective
 
-TinyFish integration, phase 1: **answer cards** and the **clean reader** in a
-new Web panel. Built, verified offline, committed and pushed.
+The user reported Web panel problems and asked for a feature (2026-10-20):
 
-## Completed
+1. **Done:** the Find answers prompt appeared behind the Web panel.
+2. **Done:** the keyboard didn't open for Find answers.
+3. **Done:** word suggestions while typing on the on-screen keyboard.
 
-- **Web panel with answer cards and clean reader.**
-  - New: `web_assist.py`, `tests/test_web_assist.py`.
-  - Changed: `desktop_overlay.py` (`WebPanel`, `WebButton`, `AnswerCard`,
-    `WebTaskBridge`, `request_answers`, `request_read_page`, Web pill button,
-    new icons, `web_client` option on `configure_overlay`), `main.py`
-    (`WEB_CLIENT` from `TINYFISH_API_KEY`, `reader_font_px` setting),
-    `voice_commands.py` (`READ_PAGE` intent; "find" / "look up" / question
-    phrasings; `set_web_handlers`), `tests/test_voice_commands.py`,
-    `.env.example`, `requirements.txt` (pins `requests`, `pyperclip`, already
-    installed), `README.md`, `OVERLAY_UI_MAP.md`, `AGENTS.md`,
-    `PROJECT_CONTEXT.md`.
-  - Decisions: REST via `requests` instead of the SDK (SDK needs Python
-    3.11+); the reader gets the page URL from the browser's address bar only
-    when a known browser is in front; voice searches fall back to Google when
-    no key or overlay is available.
-- **Shared context files** (`AGENTS.md`, `PROJECT_CONTEXT.md`, `TASKS.md`,
-  `CLAUDE.md`) from the previous task. Committed with the Web panel.
-- Earlier work: commit `2997fdd` on `main`, pushed (calibration, pill, cursor
-  speed).
+## Completed (2026-10-20)
+
+- **Find answers** no longer uses a `QInputDialog`. It shows a question box
+  inside the Web panel (`WebPanel._build_ask`, `_start_question`) and opens the
+  keyboard in compose mode (`KeyboardOverlayPanel.start_compose`). Enter or
+  Search submits; Cancel or closing the keyboard returns to the home view.
+  The panel shrinks above the keyboard (`_fit_above_keyboard`).
+- **Word suggestions:** `word_suggestions.py` plus a 4-button row above the keys
+  (`_refresh_suggestions`, `_accept_suggestion`). Works in normal typing and in
+  compose mode; resets on keyboard open and before blink-driven OS clicks.
+- **Fixes found while testing:**
+  - A stacked-widget minimum height made the panel overlap the keyboard, so
+    blinks hit the wrong window. Fixed with an `Ignored` size policy on the
+    pages and `SetNoConstraint` on the panel layout.
+  - The Web panel was 92% opaque, so text behind it showed through. It is now
+    99%, set on `self.shell`.
+  - Fetch reported a raw IP as the site name; the reader now uses the
+    requested host (found during the live API test).
+- Keyboard height grew from 340 px to 400 px for the suggestion row.
+- **"Read this page" refused with Brave open** (user report with screenshot).
+  Opening a panel from the pill called `activateWindow()`, which after a real
+  click made OptiKinesis the foreground app. Removed the call. `WebPanel` now
+  tracks the last app used outside OptiKinesis, and `capture_browser_url` brings
+  that window back when OptiKinesis is in front and the window is a browser.
+  Files: `desktop_overlay.py`, `web_assist.py` (`WindowInfo`,
+  `foreground_window`, `activate_window`), `tests/test_web_assist.py`.
+  **Not verified with a real click**; simulated clicks can't reproduce it.
+
+- **Voice typing on the keyboard** (user request). New `speech_input.py` and
+  `tests/test_speech_input.py`. A Speak button sits at the left of the
+  keyboard's suggestion row (`desktop_overlay.py`: `VoiceTypingBridge`,
+  `_toggle_voice`, `_insert_dictation`). Installed `SpeechRecognition==3.17.0`
+  into `.venv`, and pinned it and `sounddevice==0.5.5` in `requirements.txt`.
 
 ## Verification results
 
 | Date | Command / check | Result |
 |---|---|---|
-| 2026-10-13 | `$env:PYTHONDONTWRITEBYTECODE="1"; .\.venv\Scripts\python.exe -m unittest discover` (in repo, at handoff) | Ran 55 tests, OK |
-| 2026-10-13 | Scratch harness `live_web.py`: Web panel on screen with a fake TinyFish client and blink clicks through `GazeClickBridge` | 17/17 checks passed |
-| 2026-10-13 | Scratch harness `smoke_app.py`: real `run_application` with camera stubbed | 13/13 passed; clean exit; foreground detection returned `code.exe` |
-| 2026-10-13 | Unauthenticated `requests` probe of Search and Fetch endpoints | Both return `401 MISSING_API_KEY` (documented format) |
+| 2026-10-20 | `$env:PYTHONDONTWRITEBYTECODE="1"; .\.venv\Scripts\python.exe -m unittest discover` (in repo, after voice typing) | Ran 79 tests, OK |
+| 2026-10-20 | Scratch `speech_e2e.py`: Windows TTS sentence through a fake mic stream, the endpointer and real Google recognition | Stopped on the pause; recognized "please find gentle stretching exercises for people with als" exactly in 1.3–1.5 s; real headset mic opened at 16 kHz (no audio saved) |
+| 2026-10-20 | Scratch `live_voice.py`: Speak button on screen with a stubbed recognizer | 13/13 passed |
+| 2026-10-20 | Same suite, after the foreground fix | Ran 66 tests, OK |
+| 2026-10-20 | Scratch `fg_probe.py`: open the Web panel via the pill button | Foreground unchanged (`code.exe`); panel remembered `code.exe` as the last outside app |
+| 2026-10-20 | Scratch `live_keyboard.py`: question box, compose mode, suggestions; PyAutoGUI calls intercepted | 19/19 passed, 3 consecutive runs |
+| 2026-10-20 | Scratch `live_web.py`: Web panel with a fake client | 17/17 passed |
+| 2026-10-20 | Scratch `smoke_app.py`: real launch, camera stubbed | 12/13. The one failure expects no API key, but `.env` now has one. Expected, not a regression |
+| 2026-10-20 | Live `web_assist` calls with the user's key | Search: 5 results in 2.7 s. Fetch: 2 pages in 1.4 s and 3.9 s |
 
-The harnesses (`live_web.py`, `smoke_app.py`, `live_pill.py`,
-`live_calibration.py`) lived in the Claude session scratchpad, not the repo,
-and are not available to other agents. They used fake clients, a stubbed
-`capture_browser_url`, and no real OS clicks.
+The scratch harnesses are not in the repo. See `PROJECT_CONTEXT.md` for the
+approach.
 
-**Not verified (assumptions):**
-- Real TinyFish responses match the documented shapes. Parsing follows the
-  docs, but no key was available.
-- "Read this page" works against a live browser. Only the fake keystroke
-  path and foreground detection (`code.exe`) were exercised.
-- The Web panel works under real head tracking and blinks.
-- The voice dialog to Web panel hand-off when triggered by real speech.
+**Not verified:**
+- Voice typing with a real person speaking into the microphone. The
+  recognition was tested with synthesized speech.
+- The new flow under real head tracking and blinks.
+- The full Web panel UI against the live API (UI tested with fakes only).
+- "Read this page" against a live browser.
+- Suggestion accuracy when the user edits text by other means (e.g. physical
+  mouse clicks), which don't reset the current word.
 
-## Blockers
+## Next steps
 
-- No `TINYFISH_API_KEY` in this environment, so live API testing needs the user.
-
-## Next steps (prioritized)
-
-1. With a key in `.env`, run `.\.venv\Scripts\python.exe main.py`. Use
-   Web → Find answers, open a card, and Web → Read this page with Chrome or
-   Edge in front. Record the results here and fix any parsing differences in
-   `web_assist.py`.
-2. Remove tracked `__pycache__/*.pyc` from Git with `git rm --cached` (needs
-   commit authorization).
-3. Manual test of calibration and pill with a real user. After that, the
-   backlog in `PROJECT_CONTEXT.md` → Known issues: blink default, SOS reporting.
+1. The user runs `.\.venv\Scripts\python.exe main.py` and tries Web → Find
+   answers (typing, suggestions, Search) and normal typing with suggestions.
+   Record the results here.
+2. Commit when the user authorizes it (exclude `.pyc` and `.env`).
+3. Consider replacing the pill Voice button's `QInputDialog` with the same
+   in-panel compose pattern, since it may also get hidden behind panels.

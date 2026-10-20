@@ -26,6 +26,8 @@ controls in a browser.
 | `fatigue_monitor.py` | Rolling-window blink-rate monitor. |
 | `voice_commands.py` | Regex intent parser and executor (search, read page, email, alarm, reminder). |
 | `web_assist.py` | Pure-Python TinyFish Search/Fetch REST client, reader text cleanup, browser-address capture. UI is `WebPanel` in `desktop_overlay.py`. |
+| `word_suggestions.py` | Pure-Python word completion for the on-screen keyboard (built-in word list, no learning). |
+| `speech_input.py` | Voice typing for the keyboard's Speak button: `sounddevice` recording, energy endpointing, Google recognition via `SpeechRecognition`. |
 | `templates/`, `static/` | Web dashboard (`--web` only). `static/preview.html` is a stale legacy page. |
 | `tests/` | `unittest` suites. |
 | `face_landmarker.task` | MediaPipe model (downloaded automatically if missing). |
@@ -96,6 +98,9 @@ which reads `settings.json` and appends to `optikinesis.log`.
 - Search queries and page URLs go to TinyFish when the Web panel is used.
   Never send page content, keystrokes or other personal data there beyond
   what a feature needs. Tests must use fake sessions, not the live API.
+- Voice typing sends the recorded utterance to Google's speech service. Record
+  only while the Speak button is active, never save audio, and keep tests on
+  fake streams or synthesized audio.
 - `settings.json` holds personal data (emergency contact, calibration) and
   is gitignored. Do not commit it or paste its contents into shared files.
 - The Flask server has no authentication and can type keystrokes and trigger

@@ -138,6 +138,8 @@ through `WebTaskBridge`.
 | What to change | Where |
 |---|---|
 | **Home actions and descriptions** | `_build_home()` |
+| **Question box (Find answers)** | `_build_ask()`; `_start_question()` opens the keyboard in compose mode and `_fit_above_keyboard()` shrinks the panel so the two never overlap |
+| **Panel opacity** | the `QFrame#panelShell` stylesheet set on `self.shell` in `WebPanel.__init__` |
 | **Card look (fonts, lines shown)** | `AnswerCard.paintEvent()` |
 | **Big button look** | `WebButton` and `_FlashMixin._paint_card()` |
 | **Reader colors, scrollbar** | stylesheet in `_build_reader()` |
@@ -154,9 +156,20 @@ through `WebTaskBridge`.
 
 ```python
 width=min(1400, int(SCREEN_W * 0.85))   # Panel width
-height=min(340, int(SCREEN_H * 0.44))   # Panel height
+height=min(400, int(SCREEN_H * 0.5))    # Panel height (includes the suggestion row)
 self.header.hide()  # Line 315 — title bar hidden for compact look
 ```
+
+### Word Suggestions and Compose Mode
+
+| What to change | Where |
+|---|---|
+| **Number of suggestions** | `MAX_SUGGESTIONS` in `word_suggestions.py` |
+| **Word list** | `_COMMON` in `word_suggestions.py` (most common first; care words included) |
+| **Suggestion row look** | `QPushButton#suggestBtn` stylesheet in `KeyboardOverlayPanel.__init__` |
+| **What a suggestion types** | `_accept_suggestion()` types only the missing letters plus a space |
+| **Typing into an overlay field** | `start_compose()` / `stop_compose()`: keys edit the hidden buffer and call back, nothing goes to other apps (used by the Web panel's question box) |
+| **Fresh word after a click elsewhere** | `note_external_click()`, called by `GazeClickBridge` before OS clicks |
 
 ### Layout Spacing (Lines 323–343)
 

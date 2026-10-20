@@ -19,6 +19,7 @@ https://docs.tinyfish.ai/fetch-api/reference): both endpoints take an
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -153,6 +154,14 @@ def site_name_of(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _is_ip_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def _collapse(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -268,12 +277,16 @@ class TinyFishClient:
         if not text:
             raise WebAssistError(FETCH_ERROR_MESSAGES["empty_content"], code="empty_content")
         final_url = str(item.get("final_url") or page_url)
+        # Some fetches report a raw IP as the final address; keep the friendly name.
+        site = site_name_of(final_url)
+        if not site or _is_ip_address(site):
+            site = site_name_of(page_url)
         return Article(
             url=page_url,
             final_url=final_url,
-            title=_collapse(str(item.get("title") or "")) or site_name_of(final_url),
+            title=_collapse(str(item.get("title") or "")) or site,
             text=text,
-            site_name=site_name_of(final_url),
+            site_name=site,
             description=_collapse(str(item.get("description") or "")),
             author=_collapse(str(item.get("author") or "")),
             published_date=_collapse(str(item.get("published_date") or "")),
@@ -306,8 +319,14 @@ def _http_error(response) -> WebAssistError:
 
 # ── "Read this page": copy the address of the page in the user's browser ──
 
-def foreground_process_name() -> Optional[str]:
-    """Executable name of the foreground window's process (Windows only)."""
+@dataclass(frozen=True)
+class WindowInfo:
+    hwnd: int
+    pid: int
+    name: str  # lower-case executable name, "" if unknown
+
+
+def _user32():
     try:
         import ctypes
         from ctypes import wintypes
@@ -316,42 +335,92 @@ def foreground_process_name() -> Optional[str]:
     if not hasattr(ctypes, "windll"):
         return None
     user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    return user32
+
+
+def _process_name(pid: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
     kernel32 = ctypes.windll.kernel32
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return None
-    pid = wintypes.DWORD()
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
-        return None
+        return ""
     try:
         size = wintypes.DWORD(1024)
         buffer = ctypes.create_unicode_buffer(size.value)
         if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-            return None
+            return ""
         return os.path.basename(buffer.value).lower()
     finally:
         kernel32.CloseHandle(handle)
 
 
+def foreground_window() -> Optional[WindowInfo]:
+    """The foreground window, its process id and executable name (Windows only)."""
+    user32 = _user32()
+    if user32 is None:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return WindowInfo(hwnd=int(hwnd), pid=int(pid.value), name=_process_name(pid.value))
+
+
+def foreground_process_name() -> Optional[str]:
+    """Executable name of the foreground window's process (Windows only)."""
+    info = foreground_window()
+    return info.name if info else None
+
+
+def activate_window(hwnd: int) -> bool:
+    """Bring a window to the front. Windows allows this while our app is in front."""
+    user32 = _user32()
+    if user32 is None:
+        return False
+    return bool(user32.SetForegroundWindow(hwnd))
+
+
 def capture_browser_url(
-    process_name: Callable[[], Optional[str]] = foreground_process_name,
+    foreground: Callable[[], Optional[WindowInfo]] = foreground_window,
+    last_external: Optional[WindowInfo] = None,
+    activate: Callable[[int], bool] = activate_window,
     clipboard=None,
     keys=None,
     sleep: Callable[[float], None] = time.sleep,
     wait_s: float = 1.2,
+    own_pid: Optional[int] = None,
 ) -> str:
-    """Copy the address of the page open in the foreground browser.
+    """Copy the address of the page open in the user's browser.
 
-    Sends Ctrl+L, Ctrl+C, Esc to the browser (the overlay never takes focus,
-    so the browser is still in front) and reads the clipboard.  Only acts when
-    the foreground app is a known browser, and restores the previous clipboard
-    text afterwards.  The injected keystrokes are ignored by the caregiver
-    hotkey listener.
+    Sends Ctrl+L, Ctrl+C, Esc to the browser and reads the clipboard, then
+    restores the previous clipboard text.  Only acts on a known browser.
+
+    If OptiKinesis itself is in front (for example right after its window
+    was clicked), ``last_external`` (the last app the user used outside
+    OptiKinesis) is brought back to the front first, as long as it is a
+    browser.  The injected keystrokes are ignored by the caregiver hotkey
+    listener.
     """
-    name = process_name()
-    if name not in BROWSER_PROCESSES:
+    own_pid = os.getpid() if own_pid is None else own_pid
+    current = foreground()
+    if (
+        (current is None or current.pid == own_pid)
+        and last_external is not None
+        and last_external.name in BROWSER_PROCESSES
+    ):
+        activate(last_external.hwnd)
+        sleep(0.25)
+        current = foreground()
+    if current is None or current.name not in BROWSER_PROCESSES:
         raise WebAssistError(
             "Open the page in Chrome, Edge, Firefox or Brave first, then choose Read this page.",
             code="no_browser",

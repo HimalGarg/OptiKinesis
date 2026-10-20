@@ -13,9 +13,11 @@ This module contains the PyQt5 floating overlay interface:
 - GazeClickBridge & dispatch_blink_click (Qt click routing)
 """
 
+import os
 import sys
 import time
 import math
+import html
 import threading
 import urllib.parse
 import webbrowser
@@ -30,7 +32,9 @@ except ImportError:
     wintypes = None
 
 from head_calibration import POINT_LABELS, CalibrationSession
-from web_assist import MISSING_KEY_MESSAGE, WebAssistError, capture_browser_url
+from web_assist import MISSING_KEY_MESSAGE, WebAssistError, capture_browser_url, foreground_window
+from word_suggestions import MAX_SUGGESTIONS, completion_suffix, current_word, suggest
+from speech_input import SpeechInputError, listen_and_transcribe
 
 logger = logging.getLogger("optikinesis.overlay")
 
@@ -475,6 +479,13 @@ if PYQT5_AVAILABLE:
             self.hide()
 
 
+    class VoiceTypingBridge(QtCore.QObject):
+        """Delivers voice-typing progress from the recording thread to the Qt thread."""
+
+        recognizing = QtCore.pyqtSignal(int)
+        finished = QtCore.pyqtSignal(int, str, str)  # token, text, error
+
+
     class KeyboardOverlayPanel(OverlayPanelBase):
         """Virtual QWERTY keyboard overlay panel."""
 
@@ -482,7 +493,7 @@ if PYQT5_AVAILABLE:
             super().__init__(
                 "",
                 width=min(1400, int(SCREEN_W * 0.85)),
-                height=min(340, int(SCREEN_H * 0.44)),
+                height=min(400, int(SCREEN_H * 0.5)),
             )
 
             # Hide the header entirely for a compact borderless look
@@ -495,6 +506,15 @@ if PYQT5_AVAILABLE:
             self.dynamic_buttons = []
             self.active_modifiers = set()
             self.modifier_buttons = {}
+
+            # Compose mode: keys type into an overlay field (e.g. the Web
+            # panel's question box) instead of the app in front.
+            self._compose = None
+            # Word suggestions only consider text typed after this position,
+            # so a click elsewhere on screen starts a fresh word.
+            self._context_start = 0
+            self.suggestion_buttons = []
+            self._suggested_words = []
 
             wrapper = QtWidgets.QHBoxLayout()
             wrapper.setContentsMargins(0, 0, 0, 0)
@@ -541,6 +561,88 @@ if PYQT5_AVAILABLE:
                     border-color: #2dd4ff;
                 }
             """)
+
+            suggestion_row = QtWidgets.QHBoxLayout()
+            suggestion_row.setContentsMargins(0, 0, 0, 0)
+            suggestion_row.setSpacing(0)
+
+            # Voice typing: speak instead of typing.
+            self._voice_token = 0
+            self._voice_stop = None
+            self._voice_state = "idle"
+            self._voice_bridge = VoiceTypingBridge()
+            self._voice_bridge.recognizing.connect(self._on_voice_recognizing, QtCore.Qt.QueuedConnection)
+            self._voice_bridge.finished.connect(self._on_voice_finished, QtCore.Qt.QueuedConnection)
+            self._voice_message_timer = QtCore.QTimer(self)
+            self._voice_message_timer.setSingleShot(True)
+            self._voice_message_timer.timeout.connect(lambda: self._set_voice_state("idle"))
+            self.mic_btn = QtWidgets.QPushButton("")
+            self.mic_btn.setObjectName("micBtn")
+            self.mic_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.mic_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            self.mic_btn.setIconSize(QtCore.QSize(26, 26))
+            self.mic_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #0f2f45;
+                    color: #e0f2fe;
+                    border: 1px solid #2d6a8f;
+                    border-radius: 0px;
+                    font-size: 20px;
+                    font-weight: 700;
+                    padding: 0 10px;
+                }
+                QPushButton:hover {
+                    border-color: #2dd4ff;
+                    background-color: rgba(45, 212, 255, 70);
+                }
+                QPushButton[voice="listening"] {
+                    background-color: #7f1d1d;
+                    border-color: #f87171;
+                    color: #ffffff;
+                }
+                QPushButton[voice="recognizing"] {
+                    background-color: #3b2f0b;
+                    border-color: #fbbf24;
+                    color: #fde68a;
+                }
+                QPushButton[voice="message"] {
+                    color: #fbbf24;
+                    font-size: 15px;
+                }
+            """)
+            self.mic_btn.clicked.connect(lambda _checked=False: self._toggle_voice())
+            suggestion_row.addWidget(self.mic_btn, 1)
+            self._set_voice_state("idle")
+
+            for index in range(MAX_SUGGESTIONS):
+                btn = QtWidgets.QPushButton("")
+                btn.setObjectName("suggestBtn")
+                btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #0b2233;
+                        color: #7dd3fc;
+                        border: 1px solid #1f4f6e;
+                        border-radius: 0px;
+                        font-size: 24px;
+                        font-weight: 600;
+                    }
+                    QPushButton:hover {
+                        border-color: #2dd4ff;
+                        color: #ffffff;
+                        background-color: rgba(45, 212, 255, 70);
+                    }
+                    QPushButton:disabled {
+                        color: #4b6a82;
+                        font-size: 16px;
+                        font-weight: 400;
+                    }
+                """)
+                btn.clicked.connect(lambda _checked=False, i=index: self._accept_suggestion(i))
+                suggestion_row.addWidget(btn, 1)
+                self.suggestion_buttons.append(btn)
+            keyboard_rows.addLayout(suggestion_row, 1)
 
             def build_row(specs):
                 row_layout = QtWidgets.QHBoxLayout()
@@ -683,10 +785,11 @@ if PYQT5_AVAILABLE:
                     border-color: #ff6666;
                 }
             """
-            for btn in (google_btn, yt_btn, ext_btn):
+            self.external_action_buttons = (google_btn, yt_btn, ext_btn)
+            for btn in self.external_action_buttons:
                 btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
                 btn.setFont(QtGui.QFont("Arial", 14, QtGui.QFont.Bold))
-                btn.setStyleSheet(action_css)
+                btn.setStyleSheet(action_css + "QPushButton:disabled { color: #3d566e; }")
 
             close_key_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
             close_key_btn.setFont(QtGui.QFont("Arial", 14, QtGui.QFont.Bold))
@@ -694,6 +797,7 @@ if PYQT5_AVAILABLE:
 
             self._refresh_key_labels()
             self._refresh_modifier_visuals()
+            self._refresh_suggestions()
 
             # Pin keyboard panel to bottom center of screen
             self.set_fixed_position((SCREEN_W - self.width()) // 2, SCREEN_H - self.height() - 25)
@@ -769,9 +873,205 @@ if PYQT5_AVAILABLE:
                 btn.style().unpolish(btn)
                 btn.style().polish(btn)
 
+        # ─── compose mode (typing into an overlay field) ─────────────────
+
+        @property
+        def is_composing(self):
+            return self._compose is not None
+
+        def start_compose(self, on_change, on_submit, on_cancel=None):
+            """Route typing to an overlay field until stop_compose().
+
+            on_change(text, cursor_pos) runs after every edit, on_submit(text)
+            when Enter is pressed, on_cancel() if the keyboard is closed.
+            """
+            self._compose = {"change": on_change, "submit": on_submit, "cancel": on_cancel}
+            self.text_area.clear()
+            self._context_start = 0
+            self.active_modifiers.clear()
+            self._refresh_modifier_visuals()
+            for btn in self.external_action_buttons:
+                btn.setEnabled(False)
+            self._after_edit()
+            self.show()
+            self.raise_()
+
+        def stop_compose(self):
+            """Leave compose mode without notifying the field owner."""
+            self._compose = None
+            self.text_area.clear()
+            self._context_start = 0
+            for btn in self.external_action_buttons:
+                btn.setEnabled(True)
+            self._refresh_suggestions()
+
+        def hideEvent(self, event):
+            if hasattr(self, "mic_btn"):
+                self._stop_voice()
+            if self._compose is not None:
+                on_cancel = self._compose.get("cancel")
+                self.stop_compose()
+                if on_cancel is not None:
+                    try:
+                        on_cancel()
+                    except Exception:
+                        logger.exception("Compose cancel handler failed")
+            super().hideEvent(event)
+
+        def showEvent(self, event):
+            if self._compose is None:
+                # Start word suggestions fresh for whatever field is now in use.
+                self.note_external_click()
+            super().showEvent(event)
+
+        def note_external_click(self):
+            """The user clicked elsewhere: the next word starts from scratch."""
+            if self._compose is None:
+                self._context_start = len(self.text_area.toPlainText())
+                self._refresh_suggestions()
+
+        def _after_edit(self):
+            self._refresh_suggestions()
+            if self._compose is not None:
+                try:
+                    cursor = self.text_area.textCursor()
+                    self._compose["change"](self.text_value(), cursor.position())
+                except Exception:
+                    logger.exception("Compose change handler failed")
+
+        # ─── word suggestions ────────────────────────────────────────────
+
+        def _current_prefix(self):
+            cursor = self.text_area.textCursor()
+            text = self.text_area.toPlainText()
+            position = cursor.position()
+            if position < self._context_start:
+                return ""
+            return current_word(text[self._context_start:position])
+
+        def _refresh_suggestions(self):
+            prefix = self._current_prefix()
+            words = suggest(prefix, MAX_SUGGESTIONS) if prefix else []
+            self._suggested_words = words
+            for index, btn in enumerate(self.suggestion_buttons):
+                if index < len(words):
+                    btn.setText(words[index])
+                    btn.setEnabled(True)
+                else:
+                    btn.setText("Word suggestions appear as you type" if index == 0 and not words else "")
+                    btn.setEnabled(False)
+
+        def _accept_suggestion(self, index):
+            if index >= len(self._suggested_words):
+                return
+            word = self._suggested_words[index]
+            prefix = self._current_prefix()
+            self.insert_text(completion_suffix(prefix, word) + " ")
+            if self.shift:
+                self.shift = False
+                self._refresh_modifier_visuals()
+                self._refresh_key_labels()
+
+        # ─── voice typing ────────────────────────────────────────────────
+
+        @staticmethod
+        def _mic_icon(color):
+            pixmap = QtGui.QPixmap(28, 28)
+            pixmap.fill(QtCore.Qt.transparent)
+            painter = QtGui.QPainter(pixmap)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            _draw_pill_icon(painter, "mic", QtCore.QRectF(2, 2, 24, 24), color)
+            painter.end()
+            return QtGui.QIcon(pixmap)
+
+        def _set_voice_state(self, state, message=""):
+            self._voice_state = state
+            labels = {
+                "idle": ("Speak", QtGui.QColor(224, 242, 254)),
+                "listening": ("Listening… (press to stop)", QtGui.QColor(255, 255, 255)),
+                "recognizing": ("Recognizing…", QtGui.QColor(253, 230, 138)),
+                "message": (message, QtGui.QColor(251, 191, 36)),
+            }
+            text, color = labels.get(state, labels["idle"])
+            self.mic_btn.setText("  " + text)
+            self.mic_btn.setIcon(self._mic_icon(color))
+            self.mic_btn.setProperty("voice", state)
+            self.mic_btn.style().unpolish(self.mic_btn)
+            self.mic_btn.style().polish(self.mic_btn)
+
+        def _toggle_voice(self):
+            if self._voice_state == "listening":
+                if self._voice_stop is not None:
+                    self._voice_stop.set()  # finish now and recognize what was said
+                return
+            if self._voice_state == "recognizing":
+                return
+            self._voice_message_timer.stop()
+            self._voice_token += 1
+            token = self._voice_token
+            stop = threading.Event()
+            self._voice_stop = stop
+            self._set_voice_state("listening")
+            bridge = self._voice_bridge
+
+            def worker():
+                text, error = "", ""
+                try:
+                    text = listen_and_transcribe(
+                        stop, on_recognizing=lambda: bridge.recognizing.emit(token)
+                    )
+                except SpeechInputError as exc:
+                    error = exc.message
+                except Exception:
+                    logger.exception("Voice typing failed")
+                    error = "Voice typing didn't work. Please try again."
+                bridge.finished.emit(token, text, error)
+
+            threading.Thread(target=worker, name="voice-typing", daemon=True).start()
+
+        def _on_voice_recognizing(self, token):
+            if token == self._voice_token and self._voice_state == "listening":
+                self._set_voice_state("recognizing")
+
+        def _on_voice_finished(self, token, text, error):
+            if token != self._voice_token:
+                return  # cancelled (keyboard closed) or superseded
+            self._voice_stop = None
+            if error:
+                self._set_voice_state("message", error)
+                self._voice_message_timer.start(3500)
+                return
+            self._set_voice_state("idle")
+            self._insert_dictation(text)
+
+        def _insert_dictation(self, text):
+            text = (text or "").strip()
+            if not text:
+                return
+            cursor = self.text_area.textCursor()
+            before = self.text_area.toPlainText()[self._context_start:cursor.position()]
+            if before and not before[-1].isspace():
+                text = " " + text
+            self.insert_text(text + " ")
+
+        def _stop_voice(self):
+            if self._voice_stop is not None:
+                self._voice_stop.set()
+                self._voice_stop = None
+            self._voice_token += 1  # ignore any late result
+            self._voice_message_timer.stop()
+            self._set_voice_state("idle")
+
+        # ─── key handling ────────────────────────────────────────────────
+
         def _consume_modifiers(self, key):
             if not self.active_modifiers:
                 return False
+            if self._compose is not None:
+                # Shortcuts would act on another app; drop them while composing.
+                self.active_modifiers.clear()
+                self._refresh_modifier_visuals()
+                return True
             key_map = {
                 "Backspace": "backspace", "Tab": "tab", "Enter": "enter",
                 "Space": "space", "Left": "left", "Right": "right",
@@ -799,6 +1099,8 @@ if PYQT5_AVAILABLE:
                 self._refresh_modifier_visuals()
                 return
             if key == "Menu":
+                if self._compose is not None:
+                    return
                 try:
                     pyautogui.press("apps")
                 except Exception as exc:
@@ -810,9 +1112,16 @@ if PYQT5_AVAILABLE:
                 self.backspace()
                 return
             if key == "Tab":
-                self.insert_text("\t")
+                if self._compose is None:
+                    self.insert_text("\t")
                 return
             if key == "Enter":
+                if self._compose is not None:
+                    try:
+                        self._compose["submit"](self.text_value())
+                    except Exception:
+                        logger.exception("Compose submit handler failed")
+                    return
                 self.insert_text("\n")
                 return
             if key == "Space":
@@ -855,14 +1164,16 @@ if PYQT5_AVAILABLE:
                 cursor = self.text_area.textCursor()
                 cursor.insertText(value)
                 self.text_area.setTextCursor(cursor)
-                if value == "\n":
-                    pyautogui.press("enter")
-                elif value == "\t":
-                    pyautogui.press("tab")
-                else:
-                    pyautogui.write(value)
+                if self._compose is None:
+                    if value == "\n":
+                        pyautogui.press("enter")
+                    elif value == "\t":
+                        pyautogui.press("tab")
+                    else:
+                        pyautogui.write(value)
             except Exception as exc:
                 logger.warning("Virtual keyboard typing failed: %s", exc)
+            self._after_edit()
 
         def backspace(self):
             try:
@@ -872,30 +1183,40 @@ if PYQT5_AVAILABLE:
                 elif cursor.position() > 0:
                     cursor.deletePreviousChar()
                 self.text_area.setTextCursor(cursor)
-                pyautogui.press('backspace')
+                if cursor.position() < self._context_start:
+                    self._context_start = cursor.position()
+                if self._compose is None:
+                    pyautogui.press('backspace')
             except Exception as exc:
                 logger.warning("Virtual keyboard backspace failed: %s", exc)
+            self._after_edit()
 
         def clear_text(self):
             try:
                 self.text_area.clear()
-                pyautogui.hotkey('ctrl', 'a')
-                pyautogui.press('backspace')
+                self._context_start = 0
+                if self._compose is None:
+                    pyautogui.hotkey('ctrl', 'a')
+                    pyautogui.press('backspace')
             except Exception as exc:
                 logger.warning("Virtual keyboard clear failed: %s", exc)
+            self._after_edit()
 
         def move_cursor(self, delta):
             try:
                 cursor = self.text_area.textCursor()
                 if delta < 0:
                     cursor.movePosition(QtGui.QTextCursor.Left, n=abs(delta))
-                    pyautogui.press('left', presses=abs(delta))
+                    if self._compose is None:
+                        pyautogui.press('left', presses=abs(delta))
                 else:
                     cursor.movePosition(QtGui.QTextCursor.Right, n=delta)
-                    pyautogui.press('right', presses=delta)
+                    if self._compose is None:
+                        pyautogui.press('right', presses=delta)
                 self.text_area.setTextCursor(cursor)
             except Exception as exc:
                 logger.warning("Virtual keyboard cursor move failed: %s", exc)
+            self._after_edit()
 
 
     class CameraOverlayPanel(OverlayPanelBase):
@@ -1918,7 +2239,8 @@ if PYQT5_AVAILABLE:
             if not was_visible:
                 panel.show()
                 panel.raise_()
-                panel.activateWindow()
+                # No activateWindow(): overlay windows must never take the
+                # foreground, or typing and "Read this page" target OptiKinesis.
                 self._collapse_timer.stop()
             self._sync_active_states()
 
@@ -2462,6 +2784,15 @@ if PYQT5_AVAILABLE:
         def __init__(self):
             super().__init__("WEB MODULE", width=min(1280, int(SCREEN_W * 0.8)),
                              height=min(880, int(SCREEN_H * 0.84)))
+            # Reading panel: keep text behind the panel from showing through.
+            # Set on the shell itself so it outranks the shared panel style.
+            self.shell.setStyleSheet("""
+                QFrame#panelShell {
+                    background-color: rgba(10, 16, 26, 252);
+                    border: 6px solid #2f4b69;
+                    border-radius: 18px;
+                }
+            """)
             self._token = 0
             self._return_page = None
             self._reader_return_page = None
@@ -2482,11 +2813,27 @@ if PYQT5_AVAILABLE:
             self.body_layout.addWidget(self.status)
 
             self.home_page = self._build_home()
+            self.ask_page = self._build_ask()
             self.busy_page = self._build_busy()
             self.answers_page = self._build_answers()
             self.reader_page = self._build_reader()
-            for page in (self.home_page, self.busy_page, self.answers_page, self.reader_page):
+            for page in (self.home_page, self.ask_page, self.busy_page,
+                         self.answers_page, self.reader_page):
+                # Hidden views must not force a minimum height, so the panel
+                # can shrink to sit above the keyboard while a question is typed.
+                page.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
                 self.stack.addWidget(page)
+            self.layout().setSizeConstraint(QtWidgets.QLayout.SetNoConstraint)
+            self._full_size = QtCore.QSize(self.width(), self.height())
+            self._asking = False
+
+            # Remember the last app used outside OptiKinesis, so "Read this
+            # page" can find the browser even if OptiKinesis is in front.
+            self._last_external = None
+            self._own_pid = os.getpid()
+            self._foreground_timer = QtCore.QTimer(self)
+            self._foreground_timer.timeout.connect(self._track_foreground)
+            self._foreground_timer.start(400)
             self._show_home()
 
         # ─── pages ───────────────────────────────────────────────────────
@@ -2514,6 +2861,47 @@ if PYQT5_AVAILABLE:
             self.home_note.setWordWrap(True)
             self.home_note.setStyleSheet("font-size: 15px; color: #94a0b2; padding: 4px;")
             layout.addWidget(self.home_note)
+            return page
+
+        def _build_ask(self):
+            page = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(16, 10, 16, 6)
+            layout.setSpacing(12)
+            prompt = QtWidgets.QLabel("What would you like to find?", page)
+            prompt.setStyleSheet("font-size: 26px; font-weight: 600; color: #f1f5f9;")
+            layout.addWidget(prompt)
+            self.question_display = QtWidgets.QLabel(page)
+            self.question_display.setTextFormat(QtCore.Qt.RichText)
+            self.question_display.setWordWrap(True)
+            self.question_display.setMinimumHeight(96)
+            self.question_display.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            self.question_display.setStyleSheet("""
+                QLabel {
+                    background: rgba(9, 13, 21, 245);
+                    color: #f1f5f9;
+                    border: 2px solid #38bdf8;
+                    border-radius: 14px;
+                    font-size: 30px;
+                    padding: 10px 18px;
+                }
+            """)
+            layout.addWidget(self.question_display, 1)
+            hint = QtWidgets.QLabel(
+                "Type with the keyboard below. Pick a suggested word to finish it in one blink.", page
+            )
+            hint.setWordWrap(True)
+            hint.setStyleSheet("font-size: 16px; color: #94a0b2;")
+            layout.addWidget(hint)
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(14)
+            cancel = WebButton("back", "Cancel", min_height=80)
+            cancel.clicked.connect(self._cancel_question)
+            search = WebButton("search", "Search", min_height=80)
+            search.clicked.connect(self._search_typed_question)
+            row.addWidget(cancel, 1)
+            row.addWidget(search, 2)
+            layout.addLayout(row)
             return page
 
         def _build_busy(self):
@@ -2728,28 +3116,89 @@ if PYQT5_AVAILABLE:
                 self._set_status(MISSING_KEY_MESSAGE, warning=True)
                 return
             if not query:
-                query = self._ask_query()
-                if not query:
-                    return
+                self._start_question()
+                return
+            self._end_question()
             self._last_query = query.strip()
             client = _web_client
             self._run("search", f"Finding answers for “{self._last_query}”",
                       lambda: client.search(self._last_query))
 
-        def _ask_query(self):
-            dialog = QtWidgets.QInputDialog()
-            dialog.setWindowTitle("Find answers")
-            dialog.setLabelText("What would you like to find?")
-            dialog.setTextValue(self._last_query)
-            dialog.setWindowFlags(dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-            dialog.setStyleSheet(
-                "QLabel, QLineEdit, QPushButton { font-size: 18px; }"
-                "QLineEdit { min-width: 560px; min-height: 42px; }"
-                "QPushButton { min-height: 40px; min-width: 110px; }"
+        # ─── typing a question with the on-screen keyboard ───────────────
+
+        def _start_question(self):
+            keyboard = keyboard_panel_widget
+            if keyboard is None:
+                self._set_status("The on-screen keyboard isn't available.", warning=True)
+                return
+            self._asking = True
+            self._set_status("")
+            self.stack.setCurrentWidget(self.ask_page)
+            self._show_question("", 0)
+            self._fit_above_keyboard(True)
+            keyboard.start_compose(
+                on_change=self._show_question,
+                on_submit=self._submit_question,
+                on_cancel=self._question_cancelled,
             )
-            if dialog.exec_() != QtWidgets.QDialog.Accepted:
-                return None
-            return dialog.textValue().strip() or None
+
+        def _show_question(self, text, cursor_pos):
+            caret = '<span style="color:#38bdf8;">│</span>'
+            if not text:
+                self.question_display.setText(
+                    caret + '<span style="color:#64748b;"> Start typing…</span>'
+                )
+                return
+            before = html.escape(text[:cursor_pos])
+            after = html.escape(text[cursor_pos:])
+            self.question_display.setText(before + caret + after)
+
+        def _submit_question(self, text):
+            question = (text or "").strip()
+            if not question:
+                self._set_status("Type a question first.", warning=True)
+                return
+            self.find_answers(question)
+
+        def _search_typed_question(self):
+            keyboard = keyboard_panel_widget
+            self._submit_question(keyboard.text_value() if keyboard is not None else "")
+
+        def _cancel_question(self):
+            self._end_question()
+            self._show_home()
+
+        def _question_cancelled(self):
+            """The keyboard was closed while typing the question."""
+            if self._asking:
+                self._asking = False
+                self._fit_above_keyboard(False)
+                if self.stack.currentWidget() is self.ask_page:
+                    self._show_home()
+
+        def _end_question(self):
+            if not self._asking:
+                return
+            self._asking = False
+            keyboard = keyboard_panel_widget
+            if keyboard is not None:
+                keyboard.stop_compose()
+                keyboard.hide()
+            self._fit_above_keyboard(False)
+
+        def _fit_above_keyboard(self, fit):
+            """Shrink the panel to sit above the keyboard while typing, or restore it."""
+            height = self._full_size.height()
+            keyboard = keyboard_panel_widget
+            if fit and keyboard is not None:
+                room = keyboard.geometry().top() - PANEL_TOP_OFFSET - 14
+                height = max(300, min(height, room))
+            if self.height() != height:
+                self.setFixedSize(self._full_size.width(), height)
+
+        def hideEvent(self, event):
+            self._end_question()
+            super().hideEvent(event)
 
         def _show_answers(self, answers):
             for card in self._cards:
@@ -2783,12 +3232,21 @@ if PYQT5_AVAILABLE:
                 return
             client = _web_client
             self._reader_return_page = self.home_page
+            last_external = self._last_external
 
             def task():
                 time.sleep(0.3)  # let focus return to the browser after any dialog
-                return client.fetch(capture_browser_url())
+                return client.fetch(capture_browser_url(last_external=last_external))
 
             self._run("read", "Opening the page in the reader", task)
+
+        def _track_foreground(self):
+            try:
+                info = foreground_window()
+            except Exception:
+                return
+            if info is not None and info.pid != self._own_pid and info.name:
+                self._last_external = info
 
         def read_url(self, url):
             if _web_client is None:
@@ -3063,6 +3521,10 @@ if PYQT5_AVAILABLE:
                         is_text_box = True
             except Exception as exc:
                 logger.debug("I-beam cursor detection unavailable: %s", exc)
+
+            # A click in another app moves its text cursor; restart word suggestions.
+            if keyboard_panel_widget is not None:
+                keyboard_panel_widget.note_external_click()
 
             try:
                 pyautogui.click(x=int(x), y=int(y))
